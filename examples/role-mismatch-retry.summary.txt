@@ -1,0 +1,29 @@
+WORKPLAN_EXECUTION_SUMMARY
+planner_version: 1.4.0
+plan_command: ["./bin/work-plan", "--agents-dir", "/tmp/agents", "plan", "examples/role-mismatch-retry.draft.json", "--output", "/tmp/role-mismatch-retry-v14.json"]
+validate_command: ["./bin/work-plan", "--agents-dir", "/tmp/agents", "validate", "/tmp/role-mismatch-retry-v14.json"]
+plan_id: role-mismatch-retry
+validate_status: passed
+effective_capacity: 2
+open_workers_at_plan_time: 0
+available_slots_at_plan_time: 2
+waves:
+  - wave: 1
+    task_ids: ["pricing-explain-a2"]
+ready_task_ids: ["pricing-explain-a2"]
+executed_task_ids: ["pricing-explain-a2"]
+not_executed_ready_task_ids: []
+superseded_worker_ids: ["worker-pricing-explain-a1"]
+workers:
+  - task_id: pricing-explain-a2
+    agent_type: analyst
+    worker_id: worker-pricing-explain-a2
+    runtime_ref: unknown
+    runtime_ref_source: unknown
+    final_status: completed
+    active_after_close: false
+    retired_from_followup: false
+    retirement_source: unknown
+active_workers_after_execution: 0
+active_worker_ids_after_execution: []
+writes_observed: false

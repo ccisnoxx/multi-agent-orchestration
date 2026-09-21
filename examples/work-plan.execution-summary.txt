@@ -1,0 +1,32 @@
+WORKPLAN_EXECUTION_SUMMARY
+planner_version: 1.3.0
+plan_command: ["./bin/work-plan", "--agents-dir", "$HOME/.codex/agents", "plan", "examples/work-plan.draft.json", "--output", "/tmp/work-plan.json"]
+validate_command: ["./bin/work-plan", "--agents-dir", "$HOME/.codex/agents", "validate", "/tmp/work-plan.json"]
+plan_id: auth-cache-fix
+validate_status: passed
+effective_capacity: 3
+open_workers_at_plan_time: 0
+available_slots_at_plan_time: 3
+waves:
+  - wave: 1
+    task_ids: ["auth-cause-a1"]
+  - wave: 2
+    task_ids: ["auth-fix-a1"]
+  - wave: 3
+    task_ids: ["auth-review-a1"]
+ready_task_ids: ["auth-cause-a1"]
+executed_task_ids: ["auth-cause-a1"]
+not_executed_ready_task_ids: []
+workers:
+  - task_id: auth-cause-a1
+    agent_type: analyst
+    worker_id: worker-old-analysis
+    runtime_ref: "/root/worker_old_analysis"
+    runtime_ref_source: thread_status_metadata
+    final_status: completed
+    active_after_close: false
+    retired_from_followup: true
+    retirement_source: reclaim_response
+active_workers_after_execution: 0
+active_worker_ids_after_execution: []
+writes_observed: false

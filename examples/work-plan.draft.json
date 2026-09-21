@@ -1,0 +1,98 @@
+{
+  "version": 3,
+  "plan_id": "auth-cache-fix",
+  "max_concurrent_workers": 3,
+  "runtime_workers": [
+    {
+      "worker_id": "worker-old-analysis",
+      "runtime_ref": "/root/worker_old_analysis",
+      "runtime_ref_source": "thread_status_metadata",
+      "task_id": "old-analysis-a1",
+      "agent_type": "analyst",
+      "status": "completed",
+      "retired_from_followup": false,
+      "retirement_source": "unknown",
+      "read_paths": [
+        "src/auth"
+      ],
+      "write_paths": []
+    }
+  ],
+  "prior_tasks": [],
+  "tasks": [
+    {
+      "task_id": "auth-cause-a1",
+      "task_name": "分析认证缓存根因",
+      "agent_type": "analyst",
+      "attempt": 1,
+      "replaces_task_id": null,
+      "depends_on": [],
+      "read_paths": [
+        "src/auth",
+        "tests/auth"
+      ],
+      "write_paths": [],
+      "independent_review": false,
+      "review_of_task_ids": [],
+      "reuse_worker_id": "worker-old-analysis",
+      "accounting_scope": "current_attempt_delta",
+      "deliverable": "定位缓存失效的权威所有者、因果链和最小修复边界。",
+      "acceptance_criteria": [
+        "提供准确的文件与符号位置",
+        "区分已证实事实、推断和证据缺口"
+      ]
+    },
+    {
+      "task_id": "auth-fix-a1",
+      "task_name": "修复认证缓存失效",
+      "agent_type": "debugger",
+      "attempt": 1,
+      "replaces_task_id": null,
+      "depends_on": [
+        "auth-cause-a1"
+      ],
+      "read_paths": [
+        "src/auth",
+        "tests/auth"
+      ],
+      "write_paths": [
+        "src/auth/cache.py",
+        "tests/auth/test_cache.py"
+      ],
+      "independent_review": false,
+      "review_of_task_ids": [],
+      "reuse_worker_id": null,
+      "accounting_scope": "not_available",
+      "deliverable": "在权威所有者处修复根因并添加最小稳定回归测试。",
+      "acceptance_criteria": [
+        "修改前的失败行为有证据",
+        "目标测试通过",
+        "不改变无关认证合同"
+      ]
+    },
+    {
+      "task_id": "auth-review-a1",
+      "task_name": "独立复核认证修复",
+      "agent_type": "reviewer",
+      "attempt": 1,
+      "replaces_task_id": null,
+      "depends_on": [],
+      "read_paths": [
+        "src/auth",
+        "tests/auth"
+      ],
+      "write_paths": [],
+      "independent_review": true,
+      "review_of_task_ids": [
+        "auth-fix-a1"
+      ],
+      "reuse_worker_id": null,
+      "accounting_scope": "not_available",
+      "deliverable": "独立检查实际 diff、回归风险和验证缺口。",
+      "acceptance_criteria": [
+        "每项发现包含触发条件和准确位置",
+        "没有确认问题时说明检查范围和未覆盖风险"
+      ]
+    }
+  ]
+}

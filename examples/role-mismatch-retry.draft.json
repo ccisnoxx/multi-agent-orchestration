@@ -1,0 +1,61 @@
+{
+  "version": 4,
+  "plan_id": "role-mismatch-retry",
+  "max_concurrent_workers": 2,
+  "runtime_workers": [
+    {
+      "worker_id": "worker-pricing-explain-a1",
+      "runtime_ref": null,
+      "runtime_ref_source": "unknown",
+      "task_id": "pricing-explain-a1",
+      "agent_type": "reviewer",
+      "status": "completed",
+      "retired_from_followup": false,
+      "retirement_source": "unknown",
+      "read_paths": [
+        "AGENTS.md",
+        "pricing.py",
+        "rules.py",
+        "test_pricing.py"
+      ],
+      "write_paths": [],
+      "superseded_by_task_id": null
+    }
+  ],
+  "prior_tasks": [
+    {
+      "task_id": "pricing-explain-a1",
+      "attempt": 1,
+      "status": "role_mismatch",
+      "worker_id": "worker-pricing-explain-a1"
+    }
+  ],
+  "tasks": [
+    {
+      "task_id": "pricing-explain-a2",
+      "task_name": "分析价格计算链",
+      "agent_type": "analyst",
+      "attempt": 2,
+      "replaces_task_id": "pricing-explain-a1",
+      "depends_on": [],
+      "read_paths": [
+        "AGENTS.md",
+        "pricing.py",
+        "rules.py",
+        "test_pricing.py"
+      ],
+      "write_paths": [],
+      "independent_review": false,
+      "review_of_task_ids": [],
+      "reuse_worker_id": null,
+      "accounting_scope": "not_available",
+      "deliverable": "解释 quote(100)=105 的当前跨模块因果链、权威定义和测试证据。",
+      "acceptance_criteria": [
+        "使用新 task_id",
+        "给出准确 file:line",
+        "区分事实、推断和证据缺口",
+        "不修改文件"
+      ]
+    }
+  ]
+}

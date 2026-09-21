@@ -1,0 +1,22 @@
+{
+  "version": 4,
+  "plan_id": "role-mismatch-retry",
+  "plan_command": ["./bin/work-plan", "--agents-dir", "/tmp/agents", "plan", "examples/role-mismatch-retry.draft.json", "--output", "/tmp/role-mismatch-retry-v14.json"],
+  "validate_command": ["./bin/work-plan", "--agents-dir", "/tmp/agents", "validate", "/tmp/role-mismatch-retry-v14.json"],
+  "validate_status": "passed",
+  "workers": [
+    {
+      "task_id": "pricing-explain-a2",
+      "agent_type": "analyst",
+      "worker_id": "worker-pricing-explain-a2",
+      "runtime_ref": null,
+      "runtime_ref_source": "unknown",
+      "final_status": "completed",
+      "active_after_close": false,
+      "retired_from_followup": false,
+      "retirement_source": "unknown"
+    }
+  ],
+  "active_worker_ids_after_execution": [],
+  "writes_observed": false
+}

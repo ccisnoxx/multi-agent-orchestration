@@ -1,0 +1,36 @@
+{
+  "version": 3,
+  "plan_id": "auth-cache-fix",
+  "plan_command": [
+    "./bin/work-plan",
+    "--agents-dir",
+    "$HOME/.codex/agents",
+    "plan",
+    "examples/work-plan.draft.json",
+    "--output",
+    "/tmp/work-plan.json"
+  ],
+  "validate_command": [
+    "./bin/work-plan",
+    "--agents-dir",
+    "$HOME/.codex/agents",
+    "validate",
+    "/tmp/work-plan.json"
+  ],
+  "validate_status": "passed",
+  "workers": [
+    {
+      "task_id": "auth-cause-a1",
+      "agent_type": "analyst",
+      "worker_id": "worker-old-analysis",
+      "runtime_ref": "/root/worker_old_analysis",
+      "runtime_ref_source": "thread_status_metadata",
+      "final_status": "completed",
+      "active_after_close": false,
+      "retired_from_followup": true,
+      "retirement_source": "reclaim_response"
+    }
+  ],
+  "active_worker_ids_after_execution": [],
+  "writes_observed": false
+}
