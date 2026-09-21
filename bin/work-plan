@@ -1,0 +1,42 @@
+#!/bin/sh
+set -eu
+
+SKILL_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+PY=${MULTI_AGENT_ORCHESTRATION_PYTHON:-}
+
+if [ -n "$PY" ]; then
+  if [ ! -x "$PY" ]; then
+    echo "ERROR: MULTI_AGENT_ORCHESTRATION_PYTHON is not executable: $PY" >&2
+    exit 2
+  fi
+else
+  DEDICATED="$HOME/.local/share/multi-agent-orchestration/.venv/bin/python"
+  if [ -x "$DEDICATED" ]; then
+    PY=$DEDICATED
+  elif command -v uv >/dev/null 2>&1; then
+    PY=$(uv python find 3.12 2>/dev/null || true)
+  fi
+
+  if [ -z "${PY:-}" ] && command -v python3 >/dev/null 2>&1; then
+    if python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+      PY=$(command -v python3)
+    fi
+  fi
+fi
+
+if [ -z "${PY:-}" ] || [ ! -x "$PY" ]; then
+  cat >&2 <<'EOF'
+ERROR: Python >= 3.10 runtime not found for WorkPlan.
+
+Recommended setup:
+  uv python install 3.12
+  uv venv "$HOME/.local/share/multi-agent-orchestration/.venv" --python 3.12 --managed-python
+
+Python 3.10 compatibility additionally requires:
+  uv pip install --python "$HOME/.local/share/multi-agent-orchestration/.venv/bin/python" \
+    'tomli>=2.0.1,<2.4'
+EOF
+  exit 2
+fi
+
+exec "$PY" "$SKILL_DIR/scripts/work_plan.py" "$@"
