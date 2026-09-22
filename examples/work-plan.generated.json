@@ -1,6 +1,6 @@
 {
   "version": 5,
-  "planner_version": "1.5.0",
+  "planner_version": "1.5.1",
   "plan_id": "auth-cache-fix",
   "max_concurrent_workers": 3,
   "effective_capacity": 3,

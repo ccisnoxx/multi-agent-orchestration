@@ -1,7 +1,7 @@
 {
   "summary_type": "WORKPLAN_EXECUTION_SUMMARY",
   "summary_version": 3,
-  "planner_version": "1.5.0",
+  "planner_version": "1.5.1",
   "plan_id": "auth-cache-fix",
   "plan_command": [
     "./bin/work-plan",

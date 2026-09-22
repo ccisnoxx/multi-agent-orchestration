@@ -1,6 +1,6 @@
 WORKPLAN_EXECUTION_SUMMARY
 summary_version: 3
-planner_version: 1.5.0
+planner_version: 1.5.1
 plan_id: auth-cache-fix
 validate_status: passed
 plan_command: ["./bin/work-plan", "--agents-dir", "examples/agents", "--codex-config", "examples/config.toml", "plan", "examples/work-plan.draft.json", "--output", "examples/work-plan.generated.json"]

@@ -16,7 +16,7 @@ from collections import defaultdict
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, TypedDict
 
-PLANNER_VERSION = "1.5.0"
+PLANNER_VERSION = "1.5.1"
 SCHEMA_VERSION = 5
 EXECUTION_RECORD_VERSION = 6
 SUMMARY_VERSION = 3

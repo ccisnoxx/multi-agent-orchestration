@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+SKILL_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+exec "$SKILL_DIR/bin/skill-python" "$SKILL_DIR/scripts/regenerate_examples.py" "$@"

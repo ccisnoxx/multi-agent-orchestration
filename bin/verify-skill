@@ -2,4 +2,4 @@
 set -eu
 
 SKILL_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
-exec "$SKILL_DIR/bin/skill-python" "$SKILL_DIR/scripts/work_plan.py" "$@"
+exec "$SKILL_DIR/bin/skill-python" "$SKILL_DIR/scripts/verify_skill.py" "$@"

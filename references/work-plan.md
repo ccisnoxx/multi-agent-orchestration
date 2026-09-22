@@ -7,7 +7,7 @@ Planner 不创建 Worker、不调用模型、不联网、不修改目标仓库�
 ## 当前版本
 
 ```text
-Planner                 1.5.0
+Planner                 1.5.1
 WorkPlan schema         5
 Execution record        6
 Summary schema          3

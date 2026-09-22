@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.5.1] - 2026-09-22
+
+### Added
+
+- `bin/skill-python`：统一选择 Skill 专属 Python，支持环境变量、Skill 内 `.venv`、专属 uv 环境和兼容回退。
+- `bin/verify-skill`：使用同一解释器执行编译、测试和示例漂移检查。
+- `bin/regenerate-examples`：不依赖系统 `python3` 的示例再生成入口。
+
+### Changed
+
+- README、安装脚本和安装完成提示不再建议直接调用 macOS 系统 `python3`。
+- `bin/work-plan` 复用统一 Python 运行时选择器，避免多个入口的解析规则漂移。
+
+### Fixed
+
+- macOS 默认 Python 3.9 环境下，手工验证命令与安装脚本实际使用的 Python 3.12 不一致的问题。
+
 ## [1.5.0] - 2026-09-22
 
 ### Added

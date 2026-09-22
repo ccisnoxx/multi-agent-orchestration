@@ -1,6 +1,6 @@
 WORKPLAN_EXECUTION_SUMMARY
 summary_version: 3
-planner_version: 1.5.0
+planner_version: 1.5.1
 plan_id: role-mismatch-retry
 validate_status: passed
 plan_command: ["./bin/work-plan", "--agents-dir", "examples/agents", "--codex-config", "examples/config.toml", "plan", "examples/role-mismatch-retry.draft.json", "--output", "examples/role-mismatch-retry.generated.json"]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -584,6 +585,21 @@ max_wait_timeout_ms = 240000
             [(plan1, execution1), (plan2, execution2)], self.roles, self.config
         )
         self.assertEqual(digest["active_worker_ids_after_execution"], [])
+
+    def test_skill_python_respects_explicit_runtime(self) -> None:
+        env = os.environ.copy()
+        env["MULTI_AGENT_ORCHESTRATION_PYTHON"] = sys.executable
+        result = subprocess.run(
+            [str(ROOT / "bin" / "skill-python"), "--print-path"],
+            check=True,
+            text=True,
+            capture_output=True,
+            env=env,
+        )
+        self.assertEqual(
+            Path(result.stdout.strip()).resolve(),
+            Path(sys.executable).resolve(),
+        )
 
     def test_examples_regenerate_without_diff(self) -> None:
         before = {

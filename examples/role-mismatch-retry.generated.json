@@ -1,6 +1,6 @@
 {
   "version": 5,
-  "planner_version": "1.5.0",
+  "planner_version": "1.5.1",
   "plan_id": "role-mismatch-retry",
   "max_concurrent_workers": 2,
   "effective_capacity": 2,

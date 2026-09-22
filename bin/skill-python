@@ -1,0 +1,71 @@
+#!/bin/sh
+set -eu
+
+SKILL_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+
+is_supported_python() {
+  candidate=$1
+  [ -x "$candidate" ] || return 1
+  "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1
+}
+
+select_python() {
+  if [ -n "${MULTI_AGENT_ORCHESTRATION_PYTHON:-}" ]; then
+    if ! is_supported_python "$MULTI_AGENT_ORCHESTRATION_PYTHON"; then
+      echo "ERROR: MULTI_AGENT_ORCHESTRATION_PYTHON must be an executable Python >= 3.10: $MULTI_AGENT_ORCHESTRATION_PYTHON" >&2
+      exit 2
+    fi
+    printf '%s\n' "$MULTI_AGENT_ORCHESTRATION_PYTHON"
+    return
+  fi
+
+  for candidate in \
+    "$SKILL_DIR/.venv/bin/python" \
+    "$HOME/.local/share/multi-agent-orchestration/.venv/bin/python"
+  do
+    if is_supported_python "$candidate"; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+
+  if command -v uv >/dev/null 2>&1; then
+    candidate=$(uv python find 3.12 2>/dev/null || true)
+    if [ -n "$candidate" ] && is_supported_python "$candidate"; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    candidate=$(command -v python3)
+    if is_supported_python "$candidate"; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  fi
+
+  cat >&2 <<'MSG'
+ERROR: Python >= 3.10 runtime not found for multi-agent-orchestration.
+
+Recommended dedicated environment:
+  uv python install 3.12
+  uv venv "$HOME/.local/share/multi-agent-orchestration/.venv" --python 3.12 --managed-python
+  uv pip install \
+    --python "$HOME/.local/share/multi-agent-orchestration/.venv/bin/python" \
+    -r requirements.txt
+
+You may also set:
+  export MULTI_AGENT_ORCHESTRATION_PYTHON=/absolute/path/to/python
+MSG
+  exit 2
+}
+
+PY=$(select_python)
+
+if [ "${1:-}" = "--print-path" ]; then
+  printf '%s\n' "$PY"
+  exit 0
+fi
+
+exec "$PY" "$@"

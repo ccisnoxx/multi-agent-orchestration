@@ -2,7 +2,7 @@
 
 面向 Codex 固定角色 Profile 的多子代理编排 Skill，以及本地确定性的 WorkPlan Planner、Validator、Execution Summary、Digest 和 Doctor。
 
-## 1.5.0 重点
+## 1.5.1 重点
 
 - 固定角色模型、推理档位和 sandbox，不允许 spawn 时临时覆盖；
 - fresh Worker 强制 `fork_turns: "none"`，并提供可由 hook 调用的 `guard-dispatch` 门禁；
@@ -13,7 +13,8 @@
 - Planner 读取 Codex 配置并约束实际并发容量；
 - execution record 校验实际派发参数、写入路径和通信统计；
 - 修复 retry 可能 supersede 错误 Worker 的交叉身份漏洞；
-- 示例与 CLI 由端到端测试保持同步。
+- 示例与 CLI 由端到端测试保持同步；
+- 验证、示例再生成和 WorkPlan CLI 统一使用 Skill 专属 Python，不依赖 macOS 系统 Python。
 
 ## 目录职责
 
@@ -27,7 +28,7 @@
 ## 当前版本
 
 ```text
-Planner                 1.5.0
+Planner                 1.5.1
 WorkPlan schema         5
 Execution record        6
 Summary schema          3
@@ -51,11 +52,30 @@ uv pip install \
 
 ## 验证
 
+不要直接使用 macOS 系统自带的 `python3`。统一通过 Skill 的运行时选择器执行：
+
 ```bash
-python3 -m compileall -q scripts tests
-python3 -m unittest discover -s tests -v
-python3 scripts/regenerate_examples.py
-git diff --exit-code examples/
+./bin/verify-skill
+```
+
+该命令会优先使用：
+
+1. `MULTI_AGENT_ORCHESTRATION_PYTHON`；
+2. Skill 目录下的 `.venv/bin/python`；
+3. `$HOME/.local/share/multi-agent-orchestration/.venv/bin/python`；
+4. `uv python find 3.12`；
+5. 版本不低于 3.10 的 `python3`。
+
+查看实际选中的解释器：
+
+```bash
+./bin/skill-python --print-path
+```
+
+只重新生成示例：
+
+```bash
+./bin/regenerate-examples
 ```
 
 ## 配置检查
@@ -74,7 +94,7 @@ Doctor 校验固定 Profile 和推荐的 `multi_agent_v2` 文件配置，但不�
 解压后在新目录中执行：
 
 ```bash
-cd /path/to/multi-agent-orchestration-1.5.0
+cd /path/to/multi-agent-orchestration-1.5.1
 ./scripts/install_macos.sh \
   --target /Users/sc/.codex/skills/multi-agent-orchestration
 ```
@@ -104,16 +124,14 @@ cd /Users/sc/.codex/skills/multi-agent-orchestration
 git status --short
 git diff --stat
 git add .
-git commit -m "feat: optimize fixed-profile multi-agent orchestration"
+git commit -m "fix: use the dedicated Python runtime for local verification"
 git push origin main
 ```
 
 推送前建议再次运行：
 
 ```bash
-python3 -m unittest discover -s tests -v
-python3 scripts/regenerate_examples.py
-git diff --exit-code examples/
+./bin/verify-skill
 ```
 
 ## CLI
