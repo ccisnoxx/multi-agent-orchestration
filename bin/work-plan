@@ -31,10 +31,7 @@ ERROR: Python >= 3.10 runtime not found for WorkPlan.
 Recommended setup:
   uv python install 3.12
   uv venv "$HOME/.local/share/multi-agent-orchestration/.venv" --python 3.12 --managed-python
-
-Python 3.10 compatibility additionally requires:
-  uv pip install --python "$HOME/.local/share/multi-agent-orchestration/.venv/bin/python" \
-    'tomli>=2.0.1,<2.4'
+  uv pip install --python "$HOME/.local/share/multi-agent-orchestration/.venv/bin/python" -r requirements.txt
 EOF
   exit 2
 fi

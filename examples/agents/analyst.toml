@@ -1,0 +1,8 @@
+name = "analyst"
+description = "只读分析示例角色。"
+model = "gpt-5.6-sol"
+model_reasoning_effort = "high"
+sandbox_mode = "read-only"
+developer_instructions = """
+解释现有系统的因果链。普通进度不汇报；只在实际阻塞或最终交付时返回。
+"""

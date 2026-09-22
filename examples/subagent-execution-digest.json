@@ -1,0 +1,69 @@
+{
+  "digest_type": "SUBAGENT_EXECUTION_DIGEST",
+  "digest_version": 3,
+  "profile_evidence": {
+    "source": "agent_toml",
+    "runtime_verified": false
+  },
+  "outcome_evidence": {
+    "source": "execution_record.task_outcome",
+    "runtime_status_is_not_acceptance": true
+  },
+  "plan_count": 2,
+  "validated_plan_count": 2,
+  "plan_ids": [
+    "auth-cache-fix",
+    "role-mismatch-retry"
+  ],
+  "executed_attempt_count": 2,
+  "accepted_attempt_count": 2,
+  "independent_review_count": 0,
+  "runtime_status_counts": {
+    "completed": 2
+  },
+  "task_outcome_counts": {
+    "accepted": 2
+  },
+  "agent_profiles": [
+    {
+      "agent_type": "analyst",
+      "configured_model": "gpt-5.6-sol",
+      "configured_model_reasoning_effort": "high",
+      "configured_sandbox_mode": "read-only",
+      "profile_source": "agent_toml",
+      "profile_file": "analyst.toml",
+      "profile_sha256": "7cf1d3dbb1966bb37abd806cb9b928ddb25fd9b7aa7ae44a3aa13a2672e14e95",
+      "executed_attempt_count": 2,
+      "accepted_attempt_count": 2,
+      "independent_review_count": 0,
+      "runtime_status_counts": {
+        "completed": 2
+      },
+      "task_outcome_counts": {
+        "accepted": 2
+      }
+    }
+  ],
+  "dispatch_and_communication": {
+    "fresh_spawn_count": 1,
+    "reused_followup_count": 1,
+    "isolated_fork_count": 1,
+    "parent_followup_count": 0,
+    "worker_intermediate_message_count": 0,
+    "wait_call_count": 2,
+    "wait_timeout_count": 0,
+    "status_poll_count": 0
+  },
+  "not_executed_ready_task_ids": [],
+  "superseded_worker_ids": [
+    "worker-pricing-explain-a1"
+  ],
+  "active_worker_ids_after_execution": [],
+  "unknown_write_path_task_ids": [],
+  "writes_observed": {
+    "observed_true": 0,
+    "observed_false": 2,
+    "unknown": 0
+  },
+  "anomalies": []
+}

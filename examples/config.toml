@@ -1,0 +1,15 @@
+[agents]
+max_concurrent_threads_per_session = 4
+default_subagent_model = "gpt-5.6-luna"
+default_subagent_reasoning_effort = "high"
+
+[features.multi_agent_v2]
+enabled = true
+hide_spawn_agent_metadata = false
+expose_spawn_agent_model_overrides = false
+tool_namespace = "agents"
+wait_agent_enabled = true
+non_code_mode_only = true
+min_wait_timeout_ms = 50000
+default_wait_timeout_ms = 120000
+max_wait_timeout_ms = 240000

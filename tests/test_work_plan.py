@@ -1,28 +1,27 @@
 from __future__ import annotations
 
-import builtins
 import importlib.util
 import json
+import subprocess
+import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
-from unittest import mock
 
-SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "work_plan.py"
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "scripts" / "work_plan.py"
 spec = importlib.util.spec_from_file_location("work_plan", SCRIPT)
 assert spec and spec.loader
 work_plan = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(work_plan)
 
-
 ROLE_POLICIES = {
-    "default": "read-only",
-    "analyst": "read-only",
-    "reviewer": "read-only",
-    "critical_reviewer": "read-only",
-    "implementer": "workspace-write",
-    "debugger": "workspace-write",
+    "default": ("read-only", "gpt-5.6-luna", "high"),
+    "analyst": ("read-only", "gpt-5.6-sol", "high"),
+    "reviewer": ("read-only", "gpt-5.6-sol", "high"),
+    "critical_reviewer": ("read-only", "gpt-6-astra", "medium"),
+    "implementer": ("workspace-write", "gpt-5.6-sol", "high"),
+    "debugger": ("workspace-write", "gpt-5.6-sol", "high"),
 }
 
 
@@ -38,11 +37,12 @@ def task(
     independent_review: bool = False,
     review_of: list[str] | None = None,
     reuse_worker_id: str | None = None,
-    accounting_scope: str = "not_available",
+    task_name: str | None = None,
 ) -> dict:
+    reuse = reuse_worker_id is not None
     return {
         "task_id": task_id,
-        "task_name": task_id,
+        "task_name": task_name or task_id,
         "agent_type": role,
         "attempt": attempt,
         "replaces_task_id": replaces,
@@ -52,7 +52,11 @@ def task(
         "independent_review": independent_review,
         "review_of_task_ids": review_of or [],
         "reuse_worker_id": reuse_worker_id,
-        "accounting_scope": accounting_scope,
+        "accounting_scope": "current_attempt_delta" if reuse else "not_available",
+        "dispatch_method": "followup_task" if reuse else "spawn_agent",
+        "fork_turns": None if reuse else "none",
+        "delivery_mode": "complete_task",
+        "progress_policy": "blocker_or_final",
         "deliverable": f"deliver {task_id}",
         "acceptance_criteria": ["observable result"],
     }
@@ -61,13 +65,13 @@ def task(
 def draft(
     tasks: list[dict],
     *,
-    runtime_workers=None,
-    prior_tasks=None,
-    max_workers=3,
-    plan_id="test-plan",
+    runtime_workers: list[dict] | None = None,
+    prior_tasks: list[dict] | None = None,
+    max_workers: int = 3,
+    plan_id: str = "test-plan",
 ) -> dict:
     return {
-        "version": 4,
+        "version": 5,
         "plan_id": plan_id,
         "max_concurrent_workers": max_workers,
         "runtime_workers": runtime_workers or [],
@@ -76,1662 +80,595 @@ def draft(
     }
 
 
+def runtime_worker(
+    worker_id: str,
+    task_id: str,
+    role: str,
+    *,
+    status: str = "completed",
+    runtime_ref: str | None = None,
+    retired: bool = False,
+    retirement_source: str = "unknown",
+    superseded_by: str | None = None,
+    read_paths: list[str] | None = None,
+    write_paths: list[str] | None = None,
+) -> dict:
+    return {
+        "worker_id": worker_id,
+        "runtime_ref": runtime_ref,
+        "runtime_ref_source": "spawn_metadata" if runtime_ref else "unknown",
+        "task_id": task_id,
+        "agent_type": role,
+        "status": status,
+        "retired_from_followup": retired,
+        "retirement_source": retirement_source,
+        "superseded_by_task_id": superseded_by,
+        "read_paths": read_paths or (["src"] if not write_paths else []),
+        "write_paths": write_paths or [],
+    }
+
+
+def execution_worker(
+    task_row: dict,
+    worker_id: str,
+    *,
+    runtime_ref: str | None = None,
+    final_status: str = "completed",
+    task_outcome: str = "accepted",
+    observed_write_paths: list[str] | None = None,
+    parent_followup_count: int = 0,
+    intermediate_count: int = 0,
+) -> dict:
+    return {
+        "task_id": task_row["task_id"],
+        "agent_type": task_row["agent_type"],
+        "worker_id": worker_id,
+        "runtime_ref": runtime_ref,
+        "runtime_ref_source": "thread_status_metadata" if runtime_ref else "unknown",
+        "final_status": final_status,
+        "task_outcome": task_outcome,
+        "active_after_close": final_status in work_plan.OPEN_WORKER_STATES,
+        "retired_from_followup": final_status in work_plan.TERMINAL_RETIREMENT_STATES,
+        "retirement_source": (
+            "runtime_terminal_status"
+            if final_status in work_plan.TERMINAL_RETIREMENT_STATES
+            else "unknown"
+        ),
+        "observed_dispatch": {
+            "method": task_row["dispatch_method"],
+            "task_name": task_row["task_name"],
+            "fork_turns": task_row["fork_turns"],
+            "model_override": None,
+            "reasoning_effort_override": None,
+        },
+        "observed_write_paths": observed_write_paths,
+        "parent_followup_count": parent_followup_count,
+        "worker_intermediate_message_count": intermediate_count,
+    }
+
+
 def execution_record(
-    plan_id: str,
+    plan: dict,
     workers: list[dict],
     *,
     active_worker_ids: list[str] | None = None,
-    writes_observed: bool | None = False,
+    wait_calls: int = 1,
+    wait_timeouts: int = 0,
+    status_polls: int = 0,
 ) -> dict:
-    for worker in workers:
-        if "task_outcome" not in worker:
-            final_status = worker.get("final_status")
-            worker["task_outcome"] = {
-                "pending": "not_evaluated",
-                "running": "not_evaluated",
-                "failed": "failed",
-                "blocked": "blocked",
-                "early_stopped": "early_stopped",
-                "interrupted": "interrupted",
-                "stopped": "interrupted",
-                "reclaimed": "interrupted",
-            }.get(final_status, "accepted")
-
+    observed = [row["observed_write_paths"] for row in workers]
+    if any(value for value in observed if isinstance(value, list)):
+        writes: bool | None = True
+    elif any(value is None for value in observed):
+        writes = None
+    else:
+        writes = False
     return {
-        "version": 5,
-        "plan_id": plan_id,
-        "plan_command": ["./bin/work-plan", "plan", "/tmp/draft.json", "--output", "/tmp/plan.json"],
+        "version": 6,
+        "plan_id": plan["plan_id"],
+        "plan_command": ["./bin/work-plan", "plan", "/tmp/draft.json"],
         "validate_command": ["./bin/work-plan", "validate", "/tmp/plan.json"],
         "validate_status": "passed",
         "workers": workers,
         "active_worker_ids_after_execution": active_worker_ids or [],
-        "writes_observed": writes_observed,
+        "writes_observed": writes,
+        "communication": {
+            "wait_call_count": wait_calls,
+            "wait_timeout_count": wait_timeouts,
+            "status_poll_count": status_polls,
+        },
     }
 
 
 class WorkPlanTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
-        self.agents = Path(self.temp.name) / "agents"
+        self.root = Path(self.temp.name)
+        self.agents = self.root / "agents"
         self.agents.mkdir()
-        for name, sandbox in ROLE_POLICIES.items():
+        for name, (sandbox, model, effort) in ROLE_POLICIES.items():
             (self.agents / f"{name}.toml").write_text(
-                f'name = "{name}"\nmodel = "test"\nmodel_reasoning_effort = "high"\n'
-                f'sandbox_mode = "{sandbox}"\n',
+                f'name = "{name}"\n'
+                f'description = "{name} description"\n'
+                f'model = "{model}"\n'
+                f'model_reasoning_effort = "{effort}"\n'
+                f'sandbox_mode = "{sandbox}"\n'
+                'developer_instructions = """Complete the assigned task. Report only blockers or final output."""\n',
                 encoding="utf-8",
             )
+        self.config_path = self.root / "config.toml"
+        self.config_path.write_text(
+            """
+[agents]
+max_concurrent_threads_per_session = 4
+default_subagent_model = "gpt-5.6-luna"
+default_subagent_reasoning_effort = "high"
+
+[features.multi_agent_v2]
+enabled = true
+hide_spawn_agent_metadata = false
+expose_spawn_agent_model_overrides = false
+tool_namespace = "agents"
+wait_agent_enabled = true
+non_code_mode_only = true
+min_wait_timeout_ms = 50000
+default_wait_timeout_ms = 120000
+max_wait_timeout_ms = 240000
+""".strip()
+            + "\n",
+            encoding="utf-8",
+        )
         self.roles = work_plan.load_roles(self.agents)
+        self.config = work_plan.load_codex_config(self.config_path, required=True)
 
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def test_role_profiles_include_model_reasoning_and_sandbox(self) -> None:
+    def plan(self, payload: dict) -> dict:
+        return work_plan.canonical_plan(payload, self.roles, self.config)
+
+    def test_roles_require_complete_fixed_profile(self) -> None:
         profile = self.roles["critical_reviewer"]
-        self.assertEqual(profile["model"], "test")
-        self.assertEqual(profile["model_reasoning_effort"], "high")
+        self.assertEqual(profile["model"], "gpt-6-astra")
+        self.assertEqual(profile["model_reasoning_effort"], "medium")
         self.assertEqual(profile["sandbox_mode"], "read-only")
-        self.assertEqual(profile["config_file"], "critical_reviewer.toml")
+        self.assertEqual(len(profile["config_sha256"]), 64)
 
-    def _parse_with_python310_tomli_fallback(self, path: Path) -> dict[str, str]:
-        try:
-            import tomllib as reference_toml
-        except ImportError:  # pragma: no cover - exercised by the real 3.10 gate
-            import tomli as reference_toml
-
-        fake_tomli = types.SimpleNamespace(
-            load=reference_toml.load,
-            TOMLDecodeError=reference_toml.TOMLDecodeError,
-        )
-        real_import = builtins.__import__
-
-        def controlled_import(name, globals=None, locals=None, fromlist=(), level=0):
-            if name == "tomllib":
-                raise ModuleNotFoundError("forced Python 3.10 TOML path")
-            if name == "tomli":
-                return fake_tomli
-            return real_import(name, globals, locals, fromlist, level)
-
-        with mock.patch("builtins.__import__", side_effect=controlled_import):
-            return work_plan._parse_top_level_toml_strings(path)
-
-    def test_role_profile_requires_explicit_model_and_reasoning_effort(self) -> None:
-        broken = Path(self.temp.name) / "broken-agents"
+        broken = self.root / "broken"
         broken.mkdir()
         (broken / "reviewer.toml").write_text(
-            'name = "reviewer"\nsandbox_mode = "read-only"\n',
+            'name="reviewer"\nmodel="x"\nmodel_reasoning_effort="high"\nsandbox_mode="read-only"\n',
             encoding="utf-8",
         )
-        with self.assertRaisesRegex(work_plan.PlanError, "must explicitly declare model"):
+        with self.assertRaisesRegex(work_plan.PlanError, "description is required"):
             work_plan.load_roles(broken)
 
-    def test_role_profile_requires_reasoning_when_model_is_present(self) -> None:
-        broken = Path(self.temp.name) / "missing-reasoning-agents"
-        broken.mkdir()
-        (broken / "reviewer.toml").write_text(
-            'name = "reviewer"\nmodel = "test"\nsandbox_mode = "read-only"\n',
-            encoding="utf-8",
-        )
-        with self.assertRaisesRegex(
-            work_plan.PlanError,
-            "must explicitly declare model_reasoning_effort",
-        ):
-            work_plan.load_roles(broken)
-
-    def test_python310_tomli_fallback_ignores_nested_role_keys(self) -> None:
-        role_file = Path(self.temp.name) / "nested-role.toml"
-        role_file.write_text(
-            'name = "reviewer"\n'
-            'model = "top-level-model"\n'
-            'model_reasoning_effort = "high"\n'
-            'sandbox_mode = "read-only"\n'
-            '\n'
-            '[metadata]\n'
-            'model = "nested-model"\n'
-            'model_reasoning_effort = "low"\n',
-            encoding="utf-8",
-        )
-
-        profile = self._parse_with_python310_tomli_fallback(role_file)
-
-        self.assertEqual(profile["model"], "top-level-model")
-        self.assertEqual(profile["model_reasoning_effort"], "high")
-
-    def test_python310_tomli_fallback_accepts_trailing_comments(self) -> None:
-        role_file = Path(self.temp.name) / "commented-role.toml"
-        role_file.write_text(
-            'name = "reviewer" # role identifier\n'
-            'model = "comment-safe-model" # configured model\n'
-            'model_reasoning_effort = "medium" # configured effort\n'
-            'sandbox_mode = "read-only" # permission boundary\n',
-            encoding="utf-8",
-        )
-
-        profile = self._parse_with_python310_tomli_fallback(role_file)
-
-        self.assertEqual(
-            profile,
-            {
-                "name": "reviewer",
-                "model": "comment-safe-model",
-                "model_reasoning_effort": "medium",
-                "sandbox_mode": "read-only",
-            },
-        )
-
-    def test_python310_requires_tomli_dependency(self) -> None:
-        role_file = Path(self.temp.name) / "dependency-role.toml"
-        role_file.write_text(
-            'name = "reviewer"\n'
-            'model = "test"\n'
-            'model_reasoning_effort = "high"\n'
-            'sandbox_mode = "read-only"\n',
-            encoding="utf-8",
-        )
-        real_import = builtins.__import__
-
-        def controlled_import(name, globals=None, locals=None, fromlist=(), level=0):
-            if name in {"tomllib", "tomli"}:
-                raise ModuleNotFoundError(f"forced missing dependency: {name}")
-            return real_import(name, globals, locals, fromlist, level)
-
-        with mock.patch("builtins.__import__", side_effect=controlled_import):
-            with self.assertRaisesRegex(
-                work_plan.PlanError,
-                "Python 3.10 requires tomli>=2.0.1,<2.4",
-            ):
-                work_plan._parse_top_level_toml_strings(role_file)
-
-    def test_valid_dependency_and_independent_review_create_three_waves(self) -> None:
+    def test_capacity_is_capped_by_codex_config(self) -> None:
         payload = draft(
-            [
-                task("scan-a1", "analyst", read_paths=["src"]),
-                task(
-                    "fix-a1",
-                    "debugger",
-                    read_paths=["src", "tests"],
-                    write_paths=["src/fix.py", "tests/test_fix.py"],
-                    depends_on=["scan-a1"],
-                ),
-                task(
-                    "review-a1",
-                    "reviewer",
-                    read_paths=["src", "tests"],
-                    independent_review=True,
-                    review_of=["fix-a1"],
-                ),
-            ]
+            [task(f"scan-{i:02d}", "analyst", read_paths=[f"src/{i}"]) for i in range(6)],
+            max_workers=8,
         )
-        result = work_plan.canonical_plan(payload, self.roles)
-        self.assertEqual(
-            result["waves"],
-            [
-                {"wave": 1, "task_ids": ["scan-a1"]},
-                {"wave": 2, "task_ids": ["fix-a1"]},
-                {"wave": 3, "task_ids": ["review-a1"]},
-            ],
+        result = self.plan(payload)
+        self.assertEqual(result["effective_capacity"], 4)
+        self.assertEqual(len(result["waves"][0]["task_ids"]), 4)
+        self.assertEqual(result["codex_config_evidence"]["capacity_source"], "codex_config")
+
+    def test_doctor_accepts_fixed_profile_configuration(self) -> None:
+        report = work_plan.build_doctor_report(self.roles, self.config)
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(report["errors"], [])
+
+    def test_fresh_task_requires_isolated_fork(self) -> None:
+        row = task("scan-a1", "analyst", read_paths=["src"])
+        row["fork_turns"] = "all"
+        with self.assertRaisesRegex(work_plan.PlanError, "fork_turns=none"):
+            self.plan(draft([row]))
+
+    def test_fresh_task_rejects_followup_dispatch(self) -> None:
+        row = task("scan-a1", "analyst", read_paths=["src"])
+        row["dispatch_method"] = "followup_task"
+        with self.assertRaisesRegex(work_plan.PlanError, "dispatch_method=spawn_agent"):
+            self.plan(draft([row]))
+
+    def test_reuse_requires_followup_and_delta_accounting(self) -> None:
+        runtime = [runtime_worker("worker-analysis", "old-analysis-a1", "analyst")]
+        row = task(
+            "scan-a1",
+            "analyst",
+            read_paths=["src"],
+            reuse_worker_id="worker-analysis",
         )
+        result = self.plan(draft([row], runtime_workers=runtime))
         self.assertEqual(result["ready_task_ids"], ["scan-a1"])
+        self.assertEqual(result["tasks"][0]["dispatch_method"], "followup_task")
 
-    def test_dependency_outcome_is_not_overridden_by_completed_runtime(self) -> None:
-        for task_outcome in ("rejected", "role_mismatch", "failed", "blocked"):
-            with self.subTest(task_outcome=task_outcome):
-                runtime = [
-                    {
-                        "worker_id": "worker-upstream-a1",
-                        "runtime_ref": "/root/upstream_a1",
-                        "runtime_ref_source": "spawn_metadata",
-                        "task_id": "upstream-a1",
-                        "agent_type": "analyst",
-                        "status": "completed",
-                        "retired_from_followup": False,
-                        "retirement_source": "unknown",
-                        "read_paths": ["src/upstream"],
-                        "write_paths": [],
-                    }
-                ]
-                prior = [
-                    {
-                        "task_id": "upstream-a1",
-                        "attempt": 1,
-                        "status": task_outcome,
-                        "worker_id": "worker-upstream-a1",
-                    }
-                ]
-                payload = draft(
-                    [
-                        task(
-                            "downstream-a1",
-                            "analyst",
-                            read_paths=["src/downstream"],
-                            depends_on=["upstream-a1"],
-                        )
-                    ],
-                    runtime_workers=runtime,
-                    prior_tasks=prior,
-                )
+        row["accounting_scope"] = "not_available"
+        with self.assertRaisesRegex(work_plan.PlanError, "current_attempt_delta"):
+            self.plan(draft([row], runtime_workers=runtime))
 
-                result = work_plan.canonical_plan(payload, self.roles)
-
-                self.assertEqual(result["ready_task_ids"], [])
-                self.assertEqual(result["blocked_task_ids"], ["downstream-a1"])
-                self.assertIn(
-                    f"dependency upstream-a1 task outcome is {task_outcome}",
-                    result["blocked_reasons"]["downstream-a1"][0],
-                )
-
-    def test_completed_runtime_without_task_outcome_does_not_resolve_dependency(self) -> None:
-        runtime = [
-            {
-                "worker_id": "worker-upstream-a1",
-                "runtime_ref": "/root/upstream_a1",
-                "runtime_ref_source": "spawn_metadata",
-                "task_id": "upstream-a1",
-                "agent_type": "analyst",
-                "status": "completed",
-                "retired_from_followup": False,
-                "retirement_source": "unknown",
-                "read_paths": ["src/upstream"],
-                "write_paths": [],
-            }
+    def test_same_worker_cannot_be_reused_twice_in_one_plan(self) -> None:
+        runtime = [runtime_worker("worker-analysis", "old-analysis-a1", "analyst")]
+        rows = [
+            task("scan-a1", "analyst", read_paths=["src/a"], reuse_worker_id="worker-analysis"),
+            task("scan-b1", "analyst", read_paths=["src/b"], reuse_worker_id="worker-analysis"),
         ]
-        payload = draft(
-            [
-                task(
-                    "downstream-a1",
-                    "analyst",
-                    read_paths=["src/downstream"],
-                    depends_on=["upstream-a1"],
-                )
-            ],
-            runtime_workers=runtime,
+        with self.assertRaisesRegex(work_plan.PlanError, "at most one task"):
+            self.plan(draft(rows, runtime_workers=runtime))
+
+    def test_completed_runtime_does_not_resolve_dependency(self) -> None:
+        runtime = [runtime_worker("worker-upstream", "upstream-a1", "analyst")]
+        row = task(
+            "downstream-a1",
+            "analyst",
+            read_paths=["src/downstream"],
+            depends_on=["upstream-a1"],
         )
-
-        result = work_plan.canonical_plan(payload, self.roles)
-
+        result = self.plan(draft([row], runtime_workers=runtime))
         self.assertEqual(result["ready_task_ids"], [])
-        self.assertEqual(result["blocked_task_ids"], ["downstream-a1"])
-        self.assertEqual(
-            result["blocked_reasons"]["downstream-a1"],
-            [
-                "dependency upstream-a1 has no accepted task outcome "
-                "(runtime status=completed)"
-            ],
-        )
+        self.assertIn("no accepted task outcome", result["blocked_reasons"]["downstream-a1"][0])
 
-    def test_write_conflict_is_split_into_separate_waves(self) -> None:
-        payload = draft(
-            [
-                task("write-a1", "implementer", write_paths=["src/shared.py"]),
-                task("write-b1", "debugger", read_paths=["src"], write_paths=["src/shared.py"]),
-            ]
+    def test_prior_accepted_resolves_external_dependency(self) -> None:
+        runtime = [runtime_worker("worker-upstream", "upstream-a1", "analyst")]
+        prior = [
+            {"task_id": "upstream-a1", "attempt": 1, "status": "accepted", "worker_id": "worker-upstream"}
+        ]
+        row = task(
+            "downstream-a1",
+            "analyst",
+            read_paths=["src/downstream"],
+            depends_on=["upstream-a1"],
         )
-        result = work_plan.canonical_plan(payload, self.roles)
+        result = self.plan(draft([row], runtime_workers=runtime, prior_tasks=prior))
+        self.assertEqual(result["ready_task_ids"], ["downstream-a1"])
+
+    def test_write_conflict_creates_separate_waves(self) -> None:
+        rows = [
+            task("write-a1", "implementer", write_paths=["src/shared.py"]),
+            task("write-b1", "debugger", write_paths=["src/shared.py"]),
+        ]
+        result = self.plan(draft(rows))
         self.assertEqual(len(result["waves"]), 2)
-        self.assertEqual(result["waves"][0]["task_ids"], ["write-a1"])
-        self.assertEqual(result["waves"][1]["task_ids"], ["write-b1"])
 
-    def test_read_only_role_cannot_declare_write_ownership(self) -> None:
-        payload = draft([task("scan-a1", "analyst", write_paths=["src/file.py"])])
-        with self.assertRaisesRegex(work_plan.PlanError, "read-only role"):
-            work_plan.canonical_plan(payload, self.roles)
-
-    def test_write_role_must_declare_write_ownership(self) -> None:
-        payload = draft([task("impl-a1", "implementer", read_paths=["src"])])
-        with self.assertRaisesRegex(work_plan.PlanError, "does not declare write ownership"):
-            work_plan.canonical_plan(payload, self.roles)
-
-    def test_completed_worker_does_not_consume_capacity(self) -> None:
+    def test_active_worker_blocks_conflicting_task_and_reduces_capacity(self) -> None:
         runtime = [
-            {
-                "worker_id": "worker-old",
-                "runtime_ref": None,
-                "runtime_ref_source": "unknown",
-                "task_id": "old-task-a1",
-                "agent_type": "analyst",
-                "status": "completed",
-                "retired_from_followup": False,
-                "retirement_source": "unknown",
-                "read_paths": ["src/old"],
-                "write_paths": [],
-            }
+            runtime_worker(
+                "worker-live",
+                "live-task-a1",
+                "implementer",
+                status="running",
+                read_paths=["src/live"],
+                write_paths=["src/live/state.py"],
+            )
         ]
-        payload = draft(
-            [
-                task("scan-a1", "analyst", read_paths=["src/a"]),
-                task("scan-b1", "analyst", read_paths=["src/b"]),
-            ],
-            runtime_workers=runtime,
-            max_workers=2,
-        )
-        result = work_plan.canonical_plan(payload, self.roles)
-        self.assertEqual(result["open_workers"], 0)
-        self.assertEqual(result["available_slots"], 2)
-        self.assertEqual(result["ready_task_ids"], ["scan-a1", "scan-b1"])
-
-    def test_running_worker_reduces_capacity_and_blocks_conflicting_task(self) -> None:
-        runtime = [
-            {
-                "worker_id": "worker-live",
-                "runtime_ref": None,
-                "runtime_ref_source": "unknown",
-                "task_id": "live-task-a1",
-                "agent_type": "implementer",
-                "status": "running",
-                "retired_from_followup": False,
-                "retirement_source": "unknown",
-                "read_paths": ["src/live"],
-                "write_paths": ["src/live/state.py"],
-            }
+        rows = [
+            task("safe-a1", "analyst", read_paths=["src/other"]),
+            task("conflict-a1", "analyst", read_paths=["src/live"]),
         ]
-        payload = draft(
-            [
-                task("safe-a1", "analyst", read_paths=["src/other"]),
-                task("conflict-a1", "analyst", read_paths=["src/live"]),
-            ],
-            runtime_workers=runtime,
-            max_workers=2,
-        )
-        result = work_plan.canonical_plan(payload, self.roles)
-        self.assertEqual(result["open_workers"], 1)
+        result = self.plan(draft(rows, runtime_workers=runtime, max_workers=2))
         self.assertEqual(result["available_slots"], 1)
         self.assertEqual(result["ready_task_ids"], ["safe-a1"])
         self.assertEqual(result["blocked_task_ids"], ["conflict-a1"])
 
-    def test_retry_requires_new_id_second_attempt_and_stopped_old_worker(self) -> None:
-        runtime = [
-            {
-                "worker_id": "worker-old",
-                "runtime_ref": None,
-                "runtime_ref_source": "unknown",
-                "task_id": "fix-old-a1",
-                "agent_type": "debugger",
-                "status": "stopped",
-                "retired_from_followup": True,
-                "retirement_source": "runtime_terminal_status",
-                "read_paths": ["src"],
-                "write_paths": ["src/fix.py"],
-            }
-        ]
+    def test_retry_rejects_prior_worker_bound_to_another_task(self) -> None:
+        runtime = [runtime_worker("worker-wrong", "unrelated-a1", "analyst")]
         prior = [
-            {
-                "task_id": "fix-old-a1",
-                "attempt": 1,
-                "status": "failed",
-                "worker_id": "worker-old",
-            }
+            {"task_id": "old-task-a1", "attempt": 1, "status": "role_mismatch", "worker_id": "worker-wrong"}
         ]
-        payload = draft(
-            [
-                task(
-                    "fix-new-a2",
-                    "debugger",
-                    write_paths=["src/fix.py"],
-                    attempt=2,
-                    replaces="fix-old-a1",
-                )
-            ],
-            runtime_workers=runtime,
-            prior_tasks=prior,
+        row = task(
+            "new-task-a2",
+            "analyst",
+            read_paths=["src"],
+            attempt=2,
+            replaces="old-task-a1",
         )
-        result = work_plan.canonical_plan(payload, self.roles)
-        self.assertEqual(result["ready_task_ids"], ["fix-new-a2"])
+        with self.assertRaisesRegex(work_plan.PlanError, "belongs to task unrelated-a1"):
+            self.plan(draft([row], runtime_workers=runtime, prior_tasks=prior))
 
-    def test_retry_rejects_running_old_worker_and_third_attempt(self) -> None:
-        runtime = [
-            {
-                "worker_id": "worker-old",
-                "runtime_ref": None,
-                "runtime_ref_source": "unknown",
-                "task_id": "fix-old-a1",
-                "agent_type": "debugger",
-                "status": "running",
-                "retired_from_followup": False,
-                "retirement_source": "unknown",
-                "read_paths": ["src"],
-                "write_paths": ["src/fix.py"],
-            }
-        ]
+    def test_retry_supersedes_inactive_worker(self) -> None:
+        runtime = [runtime_worker("worker-old", "old-task-a1", "reviewer")]
         prior = [
-            {
-                "task_id": "fix-old-a1",
-                "attempt": 1,
-                "status": "failed",
-                "worker_id": "worker-old",
-            }
+            {"task_id": "old-task-a1", "attempt": 1, "status": "role_mismatch", "worker_id": "worker-old"}
         ]
-        payload = draft(
-            [
-                task(
-                    "fix-new-a2",
-                    "debugger",
-                    write_paths=["src/fix.py"],
-                    attempt=2,
-                    replaces="fix-old-a1",
-                )
-            ],
-            runtime_workers=runtime,
-            prior_tasks=prior,
+        row = task(
+            "new-task-a2",
+            "analyst",
+            read_paths=["src"],
+            attempt=2,
+            replaces="old-task-a1",
         )
-        with self.assertRaisesRegex(work_plan.PlanError, "inactive before replacement"):
-            work_plan.canonical_plan(payload, self.roles)
+        result = self.plan(draft([row], runtime_workers=runtime, prior_tasks=prior))
+        self.assertEqual(result["superseded_worker_ids"], ["worker-old"])
+        self.assertEqual(result["runtime_workers"][0]["superseded_by_task_id"], "new-task-a2")
 
-        prior[0]["attempt"] = 2
-        runtime[0]["status"] = "stopped"
-        runtime[0]["retired_from_followup"] = True
-        runtime[0]["retirement_source"] = "runtime_terminal_status"
-        payload["tasks"][0]["attempt"] = 3
-        with self.assertRaisesRegex(work_plan.PlanError, "two-attempt limit"):
-            work_plan.canonical_plan(payload, self.roles)
-
-    def test_reuse_requires_same_role_completed_state_and_delta_accounting(self) -> None:
-        runtime = [
-            {
-                "worker_id": "worker-analysis",
-                "runtime_ref": None,
-                "runtime_ref_source": "unknown",
-                "task_id": "analysis-old-a1",
-                "agent_type": "analyst",
-                "status": "completed",
-                "retired_from_followup": False,
-                "retirement_source": "unknown",
-                "read_paths": ["src"],
-                "write_paths": [],
-            }
-        ]
-        payload = draft(
-            [
-                task(
-                    "analysis-new-a1",
-                    "analyst",
-                    read_paths=["src"],
-                    reuse_worker_id="worker-analysis",
-                    accounting_scope="current_attempt_delta",
-                )
-            ],
-            runtime_workers=runtime,
-        )
-        result = work_plan.canonical_plan(payload, self.roles)
-        self.assertEqual(result["ready_task_ids"], ["analysis-new-a1"])
-
-        payload["tasks"][0]["accounting_scope"] = "not_available"
-        with self.assertRaisesRegex(work_plan.PlanError, "current_attempt_delta"):
-            work_plan.canonical_plan(payload, self.roles)
-
-    def test_independent_review_cannot_reuse_implementation_worker(self) -> None:
-        runtime = [
-            {
-                "worker_id": "worker-impl",
-                "runtime_ref": None,
-                "runtime_ref_source": "unknown",
-                "task_id": "impl-old-a1",
-                "agent_type": "reviewer",
-                "status": "completed",
-                "retired_from_followup": False,
-                "retirement_source": "unknown",
-                "read_paths": ["src"],
-                "write_paths": [],
-            }
-        ]
+    def test_independent_review_must_be_fresh(self) -> None:
+        runtime = [runtime_worker("worker-review", "old-review-a1", "reviewer")]
         prior = [
-            {
-                "task_id": "impl-target-a1",
-                "attempt": 1,
-                "status": "accepted",
-                "worker_id": None,
-            }
+            {"task_id": "impl-target-a1", "attempt": 1, "status": "accepted", "worker_id": None}
         ]
-        payload = draft(
-            [
-                task(
-                    "review-new-a1",
-                    "reviewer",
-                    read_paths=["src"],
-                    independent_review=True,
-                    review_of=["impl-target-a1"],
-                    reuse_worker_id="worker-impl",
-                    accounting_scope="current_attempt_delta",
-                )
-            ],
-            runtime_workers=runtime,
-            prior_tasks=prior,
+        row = task(
+            "review-new-a1",
+            "reviewer",
+            read_paths=["src"],
+            independent_review=True,
+            review_of=["impl-target-a1"],
+            reuse_worker_id="worker-review",
         )
-        with self.assertRaisesRegex(work_plan.PlanError, "fresh Worker"):
-            work_plan.canonical_plan(payload, self.roles)
+        with self.assertRaisesRegex(work_plan.PlanError, "independent review must use a fresh Worker"):
+            self.plan(draft([row], runtime_workers=runtime, prior_tasks=prior))
 
-    def test_cycle_is_rejected(self) -> None:
-        payload = draft(
-            [
-                task("scan-a1", "analyst", read_paths=["src/a"], depends_on=["scan-b1"]),
-                task("scan-b1", "analyst", read_paths=["src/b"], depends_on=["scan-a1"]),
-            ]
-        )
-        with self.assertRaisesRegex(work_plan.PlanError, "dependency cycle"):
-            work_plan.canonical_plan(payload, self.roles)
-
-    def test_generated_plan_validation_detects_manual_wave_edit(self) -> None:
-        payload = draft(
-            [
-                task("scan-a1", "analyst", read_paths=["src/a"]),
-                task("scan-b1", "analyst", read_paths=["src/b"]),
-            ]
-        )
-        generated = work_plan.canonical_plan(payload, self.roles)
-        validated = work_plan.validate_generated_plan(generated, self.roles)
-        self.assertEqual(validated, generated)
-
-        generated = json.loads(json.dumps(generated))
-        generated["tasks"][0]["assigned_wave"] = 2
+    def test_generated_plan_detects_manual_edit(self) -> None:
+        generated = self.plan(draft([task("scan-a1", "analyst", read_paths=["src"])]))
+        work_plan.validate_generated_plan(generated, self.roles, self.config)
+        tampered = json.loads(json.dumps(generated))
+        tampered["tasks"][0]["assigned_wave"] = 2
         with self.assertRaisesRegex(work_plan.PlanError, "tasks"):
-            work_plan.validate_generated_plan(generated, self.roles)
+            work_plan.validate_generated_plan(tampered, self.roles, self.config)
 
-
-    def test_runtime_ref_is_opaque_and_separate_from_worker_id(self) -> None:
-        runtime = [
-            {
-                "worker_id": "worker-runtime-probe",
-                "runtime_ref": "/root/runtime_metadata_probe",
-                "runtime_ref_source": "thread_status_metadata",
-                "task_id": "runtime-probe-a1",
-                "agent_type": "default",
-                "status": "completed",
-                "retired_from_followup": False,
-                "retirement_source": "unknown",
-                "read_paths": ["."],
-                "write_paths": [],
-            }
-        ]
-        payload = draft([task("scan-a1", "analyst", read_paths=["src"])], runtime_workers=runtime)
-        result = work_plan.canonical_plan(payload, self.roles)
-        self.assertEqual(result["runtime_workers"][0]["worker_id"], "worker-runtime-probe")
-        self.assertEqual(result["runtime_workers"][0]["runtime_ref"], "/root/runtime_metadata_probe")
-
-        runtime[0]["worker_id"] = "/root/runtime_metadata_probe"
-        with self.assertRaisesRegex(work_plan.PlanError, "worker_id.*invalid identifier"):
-            work_plan.canonical_plan(payload, self.roles)
-
-    def test_execution_summary_renders_fixed_contract(self) -> None:
-        payload = draft(
-            [
-                task("scan-a1", "default", read_paths=["."]),
-                task("scan-b1", "default", read_paths=["pyproject.toml"]),
-            ],
-            max_workers=2,
-        )
-        plan = work_plan.canonical_plan(payload, self.roles)
-        execution = execution_record(
-            "test-plan",
-            [
-                {
-                    "task_id": "scan-a1",
-                    "agent_type": "default",
-                    "worker_id": "worker-scan-a1",
-                    "runtime_ref": "/root/scan_a1",
-                    "runtime_ref_source": "spawn_metadata",
-                    "final_status": "completed",
-                    "active_after_close": False,
-                    "retired_from_followup": False,
-                    "retirement_source": "unknown",
-                },
-                {
-                    "task_id": "scan-b1",
-                    "agent_type": "default",
-                    "worker_id": "worker-scan-b1",
-                    "runtime_ref": None,
-                    "runtime_ref_source": "unknown",
-                    "final_status": "completed",
-                    "active_after_close": False,
-                    "retired_from_followup": False,
-                    "retirement_source": "unknown",
-                },
-            ],
-            writes_observed=False,
-        )
-        summary = work_plan.build_execution_summary(plan, execution, self.roles)
-        text = work_plan.render_execution_summary(summary)
-        self.assertTrue(text.startswith("WORKPLAN_EXECUTION_SUMMARY\nsummary_version: 2\n"))
-        self.assertIn('runtime_ref: "/root/scan_a1"', text)
-        self.assertIn("runtime_ref_source: spawn_metadata", text)
-        self.assertIn("runtime_ref: unknown", text)
-        self.assertIn("runtime_ref_source: unknown", text)
-        self.assertIn("task_outcome: accepted", text)
-        self.assertIn('configured_model: "test"', text)
-        self.assertIn('configured_model_reasoning_effort: "high"', text)
-        self.assertIn("configured_sandbox_mode: read-only", text)
-        self.assertIn("profile_source: agent_toml", text)
-        self.assertIn('ready_task_ids: ["scan-a1", "scan-b1"]', text)
-        self.assertIn("superseded_worker_ids: []", text)
-        self.assertIn("active_workers_after_execution: 0", text)
-        self.assertIn("writes_observed: false", text)
-
-    def test_execution_record_requires_task_outcome(self) -> None:
-        plan = work_plan.canonical_plan(
-            draft([task("scan-a1", "default", read_paths=["."])]),
-            self.roles,
-        )
-        execution = execution_record(
-            "test-plan",
-            [
-                {
-                    "task_id": "scan-a1",
-                    "agent_type": "default",
-                    "worker_id": "worker-scan-a1",
-                    "runtime_ref": None,
-                    "runtime_ref_source": "unknown",
-                    "final_status": "completed",
-                    "active_after_close": False,
-                    "retired_from_followup": False,
-                    "retirement_source": "unknown",
-                }
-            ],
-        )
-        execution["workers"][0].pop("task_outcome")
-        with self.assertRaisesRegex(work_plan.PlanError, "task_outcome must be a non-empty string"):
-            work_plan.build_execution_summary(plan, execution, self.roles)
-
-    def test_active_worker_requires_not_evaluated_task_outcome(self) -> None:
-        plan = work_plan.canonical_plan(
-            draft([task("scan-a1", "default", read_paths=["."])]),
-            self.roles,
-        )
-        execution = execution_record(
-            "test-plan",
-            [
-                {
-                    "task_id": "scan-a1",
-                    "agent_type": "default",
-                    "worker_id": "worker-scan-a1",
-                    "runtime_ref": None,
-                    "runtime_ref_source": "unknown",
-                    "final_status": "running",
-                    "task_outcome": "accepted",
-                    "active_after_close": True,
-                    "retired_from_followup": False,
-                    "retirement_source": "unknown",
-                }
-            ],
-            active_worker_ids=["worker-scan-a1"],
-        )
-        with self.assertRaisesRegex(work_plan.PlanError, "must be not_evaluated"):
-            work_plan.build_execution_summary(plan, execution, self.roles)
-
-    def test_execution_digest_aggregates_profiles_and_independent_reviews(self) -> None:
-        scan_plan = work_plan.canonical_plan(
-            draft(
-                [task("scan-a1", "default", read_paths=["."])],
-                plan_id="scan-plan",
-            ),
-            self.roles,
-        )
-        scan_execution = execution_record(
-            "scan-plan",
-            [
-                {
-                    "task_id": "scan-a1",
-                    "agent_type": "default",
-                    "worker_id": "worker-scan-a1",
-                    "runtime_ref": None,
-                    "runtime_ref_source": "unknown",
-                    "final_status": "completed",
-                    "active_after_close": False,
-                    "retired_from_followup": False,
-                    "retirement_source": "unknown",
-                }
-            ],
-            writes_observed=False,
-        )
-
-        review_plan = work_plan.canonical_plan(
-            draft(
-                [
-                    task(
-                        "review-a1",
-                        "critical_reviewer",
-                        read_paths=["src"],
-                        independent_review=True,
-                        review_of=["impl-target-a1"],
-                    )
-                ],
-                prior_tasks=[
-                    {
-                        "task_id": "impl-target-a1",
-                        "attempt": 1,
-                        "status": "accepted",
-                        "worker_id": None,
-                    }
-                ],
-                plan_id="review-plan",
-            ),
-            self.roles,
-        )
-        review_execution = execution_record(
-            "review-plan",
-            [
-                {
-                    "task_id": "review-a1",
-                    "agent_type": "critical_reviewer",
-                    "worker_id": "worker-review-a1",
-                    "runtime_ref": None,
-                    "runtime_ref_source": "unknown",
-                    "final_status": "completed",
-                    "active_after_close": False,
-                    "retired_from_followup": False,
-                    "retirement_source": "unknown",
-                }
-            ],
-            writes_observed=False,
-        )
-
-        digest = work_plan.build_execution_digest(
-            [(scan_plan, scan_execution), (review_plan, review_execution)],
-            self.roles,
-        )
-        self.assertEqual(digest["plan_count"], 2)
-        self.assertEqual(digest["executed_attempt_count"], 2)
-        self.assertEqual(digest["accepted_attempt_count"], 2)
-        self.assertEqual(digest["independent_review_count"], 1)
-        self.assertEqual(digest["writes_observed"]["observed_false"], 2)
-        self.assertEqual(digest["anomalies"], [])
-
-        profiles = {row["agent_type"]: row for row in digest["agent_profiles"]}
-        self.assertEqual(profiles["critical_reviewer"]["configured_model"], "test")
-        self.assertEqual(
-            profiles["critical_reviewer"]["configured_model_reasoning_effort"],
-            "high",
-        )
-        self.assertEqual(profiles["critical_reviewer"]["independent_review_count"], 1)
-
-        text = work_plan.render_execution_digest(digest)
-        self.assertIn("### 子任务执行概览", text)
-        self.assertIn("`critical_reviewer`", text)
-        self.assertIn("2/2 通过", text)
-        self.assertIn("2/2 验收通过", text)
-        self.assertIn("**异常：** 无。", text)
-        self.assertNotIn("plan_command", text)
-        self.assertNotIn("runtime_ref", text)
-        self.assertNotIn("<details>", text)
-
-    def test_execution_digest_does_not_treat_completed_role_mismatch_as_accepted(self) -> None:
-        first_plan = work_plan.canonical_plan(
-            draft(
-                [task("pricing-explain-a1", "reviewer", read_paths=["pricing.py"])],
-                plan_id="pricing-first-plan",
-            ),
-            self.roles,
-        )
-        first_execution = execution_record(
-            "pricing-first-plan",
-            [
-                {
-                    "task_id": "pricing-explain-a1",
-                    "agent_type": "reviewer",
-                    "worker_id": "worker-pricing-a1",
-                    "runtime_ref": None,
-                    "runtime_ref_source": "unknown",
-                    "final_status": "completed",
-                    "task_outcome": "role_mismatch",
-                    "active_after_close": False,
-                    "retired_from_followup": False,
-                    "retirement_source": "unknown",
-                }
-            ],
-        )
-
-        second_plan = work_plan.canonical_plan(
-            draft(
-                [
-                    task(
-                        "pricing-explain-a2",
-                        "analyst",
-                        read_paths=["pricing.py"],
-                        attempt=2,
-                        replaces="pricing-explain-a1",
-                    )
-                ],
-                runtime_workers=[
-                    {
-                        "worker_id": "worker-pricing-a1",
-                        "runtime_ref": None,
-                        "runtime_ref_source": "unknown",
-                        "task_id": "pricing-explain-a1",
-                        "agent_type": "reviewer",
-                        "status": "completed",
-                        "retired_from_followup": False,
-                        "retirement_source": "unknown",
-                        "read_paths": ["pricing.py"],
-                        "write_paths": [],
-                    }
-                ],
-                prior_tasks=[
-                    {
-                        "task_id": "pricing-explain-a1",
-                        "attempt": 1,
-                        "status": "role_mismatch",
-                        "worker_id": "worker-pricing-a1",
-                    }
-                ],
-                plan_id="pricing-second-plan",
-            ),
-            self.roles,
-        )
-        second_execution = execution_record(
-            "pricing-second-plan",
-            [
-                {
-                    "task_id": "pricing-explain-a2",
-                    "agent_type": "analyst",
-                    "worker_id": "worker-pricing-a2",
-                    "runtime_ref": None,
-                    "runtime_ref_source": "unknown",
-                    "final_status": "completed",
-                    "task_outcome": "accepted",
-                    "active_after_close": False,
-                    "retired_from_followup": False,
-                    "retirement_source": "unknown",
-                }
-            ],
-        )
-
-        digest = work_plan.build_execution_digest(
-            [(first_plan, first_execution), (second_plan, second_execution)],
-            self.roles,
-        )
-        self.assertEqual(digest["executed_attempt_count"], 2)
-        self.assertEqual(digest["accepted_attempt_count"], 1)
-        self.assertEqual(
-            digest["task_outcome_counts"],
-            {"accepted": 1, "role_mismatch": 1},
-        )
-        self.assertEqual(digest["runtime_status_counts"], {"completed": 2})
-        self.assertEqual(digest["anomalies"][0]["type"], "non_accepted_attempts")
-        self.assertEqual(
-            digest["anomalies"][0]["attempts"][0]["task_outcome"],
-            "role_mismatch",
-        )
-
-        profiles = {row["agent_type"]: row for row in digest["agent_profiles"]}
-        self.assertEqual(profiles["reviewer"]["accepted_attempt_count"], 0)
-        self.assertEqual(profiles["analyst"]["accepted_attempt_count"], 1)
-
-        text = work_plan.render_execution_digest(digest)
-        self.assertIn("1/2 验收通过", text)
-        self.assertIn("pricing-explain-a1=role_mismatch", text)
-        self.assertNotIn("2/2 成功", text)
-
-    def test_execution_digest_uses_latest_active_snapshot_and_resolves_later_execution(self) -> None:
-        first_plan = work_plan.canonical_plan(
-            draft(
-                [task("scan-a1", "default", read_paths=["."])],
-                plan_id="first-plan",
-            ),
-            self.roles,
-        )
-        first_execution = execution_record(
-            "first-plan",
-            [],
-            active_worker_ids=["worker-external"],
-            writes_observed=False,
-        )
-
-        second_plan = work_plan.canonical_plan(
-            draft(
-                [task("scan-a1", "default", read_paths=["."])],
-                plan_id="second-plan",
-            ),
-            self.roles,
-        )
-        second_execution = execution_record(
-            "second-plan",
-            [
-                {
-                    "task_id": "scan-a1",
-                    "agent_type": "default",
-                    "worker_id": "worker-scan-a1",
-                    "runtime_ref": None,
-                    "runtime_ref_source": "unknown",
-                    "final_status": "completed",
-                    "active_after_close": False,
-                    "retired_from_followup": False,
-                    "retirement_source": "unknown",
-                }
-            ],
-            active_worker_ids=[],
-            writes_observed=False,
-        )
-
-        digest = work_plan.build_execution_digest(
-            [(first_plan, first_execution), (second_plan, second_execution)],
-            self.roles,
-        )
-        self.assertEqual(digest["not_executed_ready_task_ids"], [])
-        self.assertEqual(digest["active_worker_ids_after_execution"], [])
-        self.assertEqual(digest["anomalies"], [])
-
-    def test_execution_digest_rejects_duplicate_plan(self) -> None:
-        plan = work_plan.canonical_plan(
-            draft([task("scan-a1", "default", read_paths=["."])]),
-            self.roles,
-        )
-        execution = execution_record(
-            "test-plan",
-            [
-                {
-                    "task_id": "scan-a1",
-                    "agent_type": "default",
-                    "worker_id": "worker-scan-a1",
-                    "runtime_ref": None,
-                    "runtime_ref_source": "unknown",
-                    "final_status": "completed",
-                    "active_after_close": False,
-                    "retired_from_followup": False,
-                    "retirement_source": "unknown",
-                }
-            ],
-        )
-        with self.assertRaisesRegex(work_plan.PlanError, "duplicate plan_id"):
-            work_plan.build_execution_digest(
-                [(plan, execution), (plan, execution)],
-                self.roles,
-            )
-
-    def test_execution_summary_rejects_task_not_ready(self) -> None:
-        payload = draft(
-            [
-                task("scan-a1", "analyst", read_paths=["src"]),
-                task("fix-a1", "debugger", read_paths=["src"], write_paths=["src/fix.py"], depends_on=["scan-a1"]),
-            ]
-        )
-        plan = work_plan.canonical_plan(payload, self.roles)
-        execution = execution_record(
-            "test-plan",
-            [
-                {
-                    "task_id": "fix-a1",
-                    "agent_type": "debugger",
-                    "worker_id": "worker-fix-a1",
-                    "runtime_ref": "/root/fix_a1",
-                    "runtime_ref_source": "spawn_metadata",
-                    "final_status": "completed",
-                    "active_after_close": False,
-                    "retired_from_followup": False,
-                    "retirement_source": "unknown",
-                }
-            ],
-            writes_observed=True,
-        )
-        with self.assertRaisesRegex(work_plan.PlanError, "not in the validated ready_task_ids"):
-            work_plan.build_execution_summary(plan, execution, self.roles)
-
-    def test_independent_review_rejects_existing_runtime_ref(self) -> None:
-        runtime = [
-            {
-                "worker_id": "worker-impl-a1",
-                "runtime_ref": "/root/implementation_worker",
-                "runtime_ref_source": "spawn_metadata",
-                "task_id": "impl-target-a1",
-                "agent_type": "implementer",
-                "status": "completed",
-                "retired_from_followup": False,
-                "retirement_source": "unknown",
-                "read_paths": ["src"],
-                "write_paths": ["src/implementation.py"],
-            }
-        ]
-        prior = [
-            {
-                "task_id": "impl-target-a1",
-                "attempt": 1,
-                "status": "accepted",
-                "worker_id": "worker-impl-a1",
-            }
-        ]
-        plan = work_plan.canonical_plan(
-            draft(
-                [
-                    task(
-                        "review-new-a1",
-                        "critical_reviewer",
-                        read_paths=["src"],
-                        independent_review=True,
-                        review_of=["impl-target-a1"],
-                    )
-                ],
-                runtime_workers=runtime,
-                prior_tasks=prior,
-            ),
-            self.roles,
-        )
-        execution = execution_record(
-            "test-plan",
-            [
-                {
-                    "task_id": "review-new-a1",
-                    "agent_type": "critical_reviewer",
-                    "worker_id": "worker-review-new-a1",
-                    "runtime_ref": "/root/implementation_worker",
-                    "runtime_ref_source": "thread_status_metadata",
-                    "final_status": "completed",
-                    "active_after_close": False,
-                    "retired_from_followup": False,
-                    "retirement_source": "unknown",
-                }
-            ],
-        )
-
-        with self.assertRaisesRegex(work_plan.PlanError, "fresh runtime_ref"):
-            work_plan.build_execution_digest([(plan, execution)], self.roles)
-
-    def test_replacement_rejects_replaced_worker_runtime_ref(self) -> None:
-        runtime = [
-            {
-                "worker_id": "worker-old-a1",
-                "runtime_ref": "/root/old_attempt_worker",
-                "runtime_ref_source": "spawn_metadata",
-                "task_id": "old-task-a1",
-                "agent_type": "reviewer",
-                "status": "completed",
-                "retired_from_followup": False,
-                "retirement_source": "unknown",
-                "read_paths": ["src"],
-                "write_paths": [],
-            }
-        ]
-        prior = [
-            {
-                "task_id": "old-task-a1",
-                "attempt": 1,
-                "status": "role_mismatch",
-                "worker_id": "worker-old-a1",
-            }
-        ]
-        plan = work_plan.canonical_plan(
-            draft(
-                [
-                    task(
-                        "new-task-a2",
-                        "analyst",
-                        read_paths=["src"],
-                        attempt=2,
-                        replaces="old-task-a1",
-                    )
-                ],
-                runtime_workers=runtime,
-                prior_tasks=prior,
-            ),
-            self.roles,
-        )
-        execution = execution_record(
-            "test-plan",
-            [
-                {
-                    "task_id": "new-task-a2",
-                    "agent_type": "analyst",
-                    "worker_id": "worker-new-task-a2",
-                    "runtime_ref": "/root/old_attempt_worker",
-                    "runtime_ref_source": "thread_status_metadata",
-                    "final_status": "completed",
-                    "active_after_close": False,
-                    "retired_from_followup": False,
-                    "retirement_source": "unknown",
-                }
-            ],
-        )
-
-        with self.assertRaisesRegex(work_plan.PlanError, "fresh runtime_ref"):
-            work_plan.build_execution_summary(plan, execution, self.roles)
-
-    def test_execution_summary_validates_reused_runtime_identity(self) -> None:
-        runtime = [
-            {
-                "worker_id": "worker-analysis",
-                "runtime_ref": "/root/analysis_worker",
-                "runtime_ref_source": "spawn_metadata",
-                "task_id": "analysis-old-a1",
-                "agent_type": "analyst",
-                "status": "completed",
-                "retired_from_followup": False,
-                "retirement_source": "unknown",
-                "read_paths": ["src"],
-                "write_paths": [],
-            }
-        ]
-        payload = draft(
-            [
-                task(
-                    "analysis-new-a1",
-                    "analyst",
-                    read_paths=["src"],
-                    reuse_worker_id="worker-analysis",
-                    accounting_scope="current_attempt_delta",
-                )
-            ],
-            runtime_workers=runtime,
-        )
-        plan = work_plan.canonical_plan(payload, self.roles)
-        execution = execution_record(
-            "test-plan",
-            [
-                {
-                    "task_id": "analysis-new-a1",
-                    "agent_type": "analyst",
-                    "worker_id": "worker-analysis",
-                    "runtime_ref": "/root/wrong_worker",
-                    "runtime_ref_source": "thread_status_metadata",
-                    "final_status": "completed",
-                    "active_after_close": False,
-                    "retired_from_followup": False,
-                    "retirement_source": "unknown",
-                }
-            ],
-        )
-        with self.assertRaisesRegex(work_plan.PlanError, "runtime_ref does not match"):
-            work_plan.build_execution_summary(plan, execution, self.roles)
-
-    def test_execution_summary_active_state_must_match_final_status(self) -> None:
-        plan = work_plan.canonical_plan(
-            draft([task("scan-a1", "default", read_paths=["."])]),
-            self.roles,
-        )
-        execution = execution_record(
-            "test-plan",
-            [
-                {
-                    "task_id": "scan-a1",
-                    "agent_type": "default",
-                    "worker_id": "worker-scan-a1",
-                    "runtime_ref": "/root/scan_a1",
-                    "runtime_ref_source": "spawn_metadata",
-                    "final_status": "completed",
-                    "active_after_close": True,
-                    "retired_from_followup": False,
-                    "retirement_source": "unknown",
-                }
-            ],
-            active_worker_ids=["worker-scan-a1"],
-        )
-        with self.assertRaisesRegex(work_plan.PlanError, "inconsistent with final_status"):
-            work_plan.build_execution_summary(plan, execution, self.roles)
-
-
-    def test_runtime_ref_provenance_pairs_are_enforced(self) -> None:
-        runtime = [
-            {
-                "worker_id": "worker-runtime-probe",
-                "runtime_ref": "/root/runtime_metadata_probe",
-                "runtime_ref_source": "unknown",
-                "task_id": "runtime-probe-a1",
-                "agent_type": "default",
-                "status": "completed",
-                "retired_from_followup": False,
-                "retirement_source": "unknown",
-                "read_paths": ["."],
-                "write_paths": [],
-            }
-        ]
-        payload = draft([task("scan-a1", "analyst", read_paths=["src"])], runtime_workers=runtime)
-        runtime[0].pop("runtime_ref_source")
-        with self.assertRaisesRegex(work_plan.PlanError, "runtime_ref_source must be a non-empty string"):
-            work_plan.canonical_plan(payload, self.roles)
-
-        runtime[0]["runtime_ref_source"] = "unknown"
-        with self.assertRaisesRegex(work_plan.PlanError, "requires direct spawn_metadata"):
-            work_plan.canonical_plan(payload, self.roles)
-
-        runtime[0]["runtime_ref_source"] = "task_name"
-        with self.assertRaisesRegex(work_plan.PlanError, "not runtime identity sources"):
-            work_plan.canonical_plan(payload, self.roles)
-
-        runtime[0]["runtime_ref"] = None
-        runtime[0]["runtime_ref_source"] = "spawn_metadata"
-        with self.assertRaisesRegex(work_plan.PlanError, "must be unknown when runtime_ref is null"):
-            work_plan.canonical_plan(payload, self.roles)
-
-        runtime[0]["runtime_ref_source"] = "unknown"
-        result = work_plan.canonical_plan(payload, self.roles)
-        self.assertIsNone(result["runtime_workers"][0]["runtime_ref"])
-        self.assertEqual(result["runtime_workers"][0]["runtime_ref_source"], "unknown")
-
-    def test_execution_runtime_ref_provenance_gate(self) -> None:
-        plan = work_plan.canonical_plan(
-            draft([task("scan-a1", "default", read_paths=["."])]),
-            self.roles,
-        )
-        worker = {
-            "task_id": "scan-a1",
-            "agent_type": "default",
-            "worker_id": "worker-scan-a1",
-            "runtime_ref": "/root/scan_a1",
-            "runtime_ref_source": "unknown",
-            "final_status": "completed",
-            "active_after_close": False,
-            "retired_from_followup": False,
-            "retirement_source": "unknown",
+    def test_guard_dispatch_accepts_planned_isolated_spawn(self) -> None:
+        row = task("scan-a1", "analyst", read_paths=["src"])
+        plan = self.plan(draft([row]))
+        dispatch = {
+            "method": "spawn_agent",
+            "task_name": "scan-a1",
+            "agent_type": "analyst",
+            "fork_turns": "none",
+            "model": None,
+            "reasoning_effort": None,
         }
-        execution = execution_record("test-plan", [worker])
-        with self.assertRaisesRegex(work_plan.PlanError, "requires direct spawn_metadata"):
-            work_plan.build_execution_summary(plan, execution, self.roles)
+        result = work_plan.guard_dispatch(
+            plan, "scan-a1", dispatch, self.roles, self.config
+        )
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["observed_dispatch"]["fork_turns"], "none")
 
-        worker["runtime_ref_source"] = "nickname"
-        with self.assertRaisesRegex(work_plan.PlanError, "not runtime identity sources"):
-            work_plan.build_execution_summary(plan, execution, self.roles)
+    def test_guard_dispatch_rejects_full_history_and_overrides(self) -> None:
+        row = task("scan-a1", "analyst", read_paths=["src"])
+        plan = self.plan(draft([row]))
+        dispatch = {
+            "method": "spawn_agent",
+            "task_name": "scan-a1",
+            "agent_type": "analyst",
+            "fork_turns": "all",
+            "model": None,
+            "reasoning_effort": None,
+        }
+        with self.assertRaisesRegex(work_plan.PlanError, "fork_turns"):
+            work_plan.guard_dispatch(plan, "scan-a1", dispatch, self.roles, self.config)
+        dispatch["fork_turns"] = "none"
+        dispatch["model"] = "gpt-6-astra"
+        with self.assertRaisesRegex(work_plan.PlanError, "model override"):
+            work_plan.guard_dispatch(plan, "scan-a1", dispatch, self.roles, self.config)
 
-        worker["runtime_ref"] = None
-        worker["runtime_ref_source"] = "thread_status_metadata"
-        with self.assertRaisesRegex(work_plan.PlanError, "must be unknown when runtime_ref is null"):
-            work_plan.build_execution_summary(plan, execution, self.roles)
+    def test_execution_rejects_model_override(self) -> None:
+        row = task("scan-a1", "analyst", read_paths=["src"])
+        plan = self.plan(draft([row]))
+        worker = execution_worker(plan["tasks"][0], "worker-scan", observed_write_paths=[])
+        worker["observed_dispatch"]["model_override"] = "gpt-6-astra"
+        execution = execution_record(plan, [worker])
+        with self.assertRaisesRegex(work_plan.PlanError, "model_override must be null"):
+            work_plan.build_execution_summary(plan, execution, self.roles, self.config)
 
-        worker["runtime_ref"] = "/root/scan_a1"
-        worker["runtime_ref_source"] = "thread_status_metadata"
-        summary = work_plan.build_execution_summary(plan, execution, self.roles)
-        self.assertEqual(summary["workers"][0]["runtime_ref_source"], "thread_status_metadata")
+    def test_execution_rejects_nonisolated_fresh_spawn(self) -> None:
+        row = task("scan-a1", "analyst", read_paths=["src"])
+        plan = self.plan(draft([row]))
+        worker = execution_worker(plan["tasks"][0], "worker-scan", observed_write_paths=[])
+        worker["observed_dispatch"]["fork_turns"] = "all"
+        execution = execution_record(plan, [worker])
+        with self.assertRaisesRegex(work_plan.PlanError, "does not match WorkPlan"):
+            work_plan.build_execution_summary(plan, execution, self.roles, self.config)
 
-    def test_reused_runtime_ref_may_be_reobserved_from_status_metadata(self) -> None:
+    def test_execution_rejects_write_outside_ownership(self) -> None:
+        row = task("impl-a1", "implementer", write_paths=["src/owned"])
+        plan = self.plan(draft([row]))
+        worker = execution_worker(
+            plan["tasks"][0], "worker-impl", observed_write_paths=["src/other/file.py"]
+        )
+        execution = execution_record(plan, [worker])
+        with self.assertRaisesRegex(work_plan.PlanError, "outside ownership"):
+            work_plan.build_execution_summary(plan, execution, self.roles, self.config)
+
+    def test_unknown_write_paths_are_preserved_as_anomaly(self) -> None:
+        row = task("impl-a1", "implementer", write_paths=["src/owned"])
+        plan = self.plan(draft([row], plan_id="unknown-write-plan"))
+        worker = execution_worker(plan["tasks"][0], "worker-impl", observed_write_paths=None)
+        execution = execution_record(plan, [worker])
+        summary = work_plan.build_execution_summary(plan, execution, self.roles, self.config)
+        self.assertEqual(summary["unknown_write_path_task_ids"], ["impl-a1"])
+        digest = work_plan.build_execution_digest([(plan, execution)], self.roles, self.config)
+        self.assertEqual(digest["anomalies"][0]["type"], "unknown_write_evidence")
+
+    def test_writes_observed_must_match_per_worker_evidence(self) -> None:
+        row = task("impl-a1", "implementer", write_paths=["src/owned"])
+        plan = self.plan(draft([row]))
+        worker = execution_worker(
+            plan["tasks"][0], "worker-impl", observed_write_paths=["src/owned/file.py"]
+        )
+        execution = execution_record(plan, [worker])
+        execution["writes_observed"] = False
+        with self.assertRaisesRegex(work_plan.PlanError, "inconsistent"):
+            work_plan.build_execution_summary(plan, execution, self.roles, self.config)
+
+    def test_fresh_runtime_ref_cannot_match_existing_worker(self) -> None:
         runtime = [
-            {
-                "worker_id": "worker-analysis",
-                "runtime_ref": "/root/analysis_worker",
-                "runtime_ref_source": "spawn_metadata",
-                "task_id": "analysis-old-a1",
-                "agent_type": "analyst",
-                "status": "completed",
-                "retired_from_followup": False,
-                "retirement_source": "unknown",
-                "read_paths": ["src"],
-                "write_paths": [],
-            }
+            runtime_worker(
+                "worker-old",
+                "old-task-a1",
+                "analyst",
+                runtime_ref="/root/existing",
+            )
         ]
-        plan = work_plan.canonical_plan(
-            draft(
-                [
-                    task(
-                        "analysis-new-a1",
-                        "analyst",
-                        read_paths=["src"],
-                        reuse_worker_id="worker-analysis",
-                        accounting_scope="current_attempt_delta",
-                    )
+        row = task("scan-a1", "analyst", read_paths=["src/next"])
+        plan = self.plan(draft([row], runtime_workers=runtime))
+        worker = execution_worker(
+            plan["tasks"][0], "worker-new", runtime_ref="/root/existing", observed_write_paths=[]
+        )
+        execution = execution_record(plan, [worker])
+        with self.assertRaisesRegex(work_plan.PlanError, "fresh runtime_ref"):
+            work_plan.build_execution_summary(plan, execution, self.roles, self.config)
+
+    def test_reused_worker_runtime_identity_must_match(self) -> None:
+        runtime = [
+            runtime_worker(
+                "worker-analysis",
+                "old-analysis-a1",
+                "analyst",
+                runtime_ref="/root/analysis",
+            )
+        ]
+        row = task(
+            "scan-a1",
+            "analyst",
+            read_paths=["src"],
+            reuse_worker_id="worker-analysis",
+        )
+        plan = self.plan(draft([row], runtime_workers=runtime))
+        worker = execution_worker(
+            plan["tasks"][0],
+            "worker-analysis",
+            runtime_ref="/root/wrong",
+            observed_write_paths=[],
+        )
+        execution = execution_record(plan, [worker])
+        with self.assertRaisesRegex(work_plan.PlanError, "runtime_ref does not match"):
+            work_plan.build_execution_summary(plan, execution, self.roles, self.config)
+
+    def test_completed_role_mismatch_is_not_accepted(self) -> None:
+        first_row = task("review-a1", "reviewer", read_paths=["src"])
+        first_plan = self.plan(draft([first_row], plan_id="first-plan"))
+        first_worker = execution_worker(
+            first_plan["tasks"][0],
+            "worker-review",
+            task_outcome="role_mismatch",
+            observed_write_paths=[],
+        )
+        first_execution = execution_record(first_plan, [first_worker])
+        digest = work_plan.build_execution_digest(
+            [(first_plan, first_execution)], self.roles, self.config
+        )
+        self.assertEqual(digest["accepted_attempt_count"], 0)
+        self.assertEqual(digest["runtime_status_counts"], {"completed": 1})
+        self.assertEqual(digest["task_outcome_counts"], {"role_mismatch": 1})
+
+    def test_digest_aggregates_communication(self) -> None:
+        row = task("scan-a1", "analyst", read_paths=["src"])
+        plan = self.plan(draft([row], plan_id="communication-plan"))
+        worker = execution_worker(
+            plan["tasks"][0],
+            "worker-scan",
+            observed_write_paths=[],
+            parent_followup_count=1,
+            intermediate_count=2,
+        )
+        execution = execution_record(
+            plan, [worker], wait_calls=3, wait_timeouts=2, status_polls=1
+        )
+        digest = work_plan.build_execution_digest([(plan, execution)], self.roles, self.config)
+        stats = digest["dispatch_and_communication"]
+        self.assertEqual(stats["isolated_fork_count"], 1)
+        self.assertEqual(stats["parent_followup_count"], 1)
+        self.assertEqual(stats["worker_intermediate_message_count"], 2)
+        self.assertEqual(stats["wait_call_count"], 3)
+        self.assertEqual(stats["wait_timeout_count"], 2)
+
+    def test_digest_uses_latest_active_snapshot(self) -> None:
+        row1 = task("scan-a1", "analyst", read_paths=["src/a"])
+        plan1 = self.plan(draft([row1], plan_id="active-first"))
+        execution1 = execution_record(
+            plan1, [], active_worker_ids=["worker-external"], wait_calls=1
+        )
+        row2 = task("scan-b1", "analyst", read_paths=["src/b"])
+        plan2 = self.plan(draft([row2], plan_id="active-second"))
+        worker2 = execution_worker(plan2["tasks"][0], "worker-b", observed_write_paths=[])
+        execution2 = execution_record(plan2, [worker2], active_worker_ids=[])
+        digest = work_plan.build_execution_digest(
+            [(plan1, execution1), (plan2, execution2)], self.roles, self.config
+        )
+        self.assertEqual(digest["active_worker_ids_after_execution"], [])
+
+    def test_examples_regenerate_without_diff(self) -> None:
+        before = {
+            path.relative_to(ROOT): path.read_bytes()
+            for path in (ROOT / "examples").glob("*.generated.json")
+        }
+        subprocess.run([sys.executable, str(ROOT / "scripts" / "regenerate_examples.py")], check=True)
+        after = {
+            path.relative_to(ROOT): path.read_bytes()
+            for path in (ROOT / "examples").glob("*.generated.json")
+        }
+        self.assertEqual(before, after)
+
+    def test_cli_plan_validate_summary_digest_and_doctor(self) -> None:
+        command = [
+            sys.executable,
+            str(SCRIPT),
+            "--agents-dir",
+            str(ROOT / "examples" / "agents"),
+            "--codex-config",
+            str(ROOT / "examples" / "config.toml"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "plan.json"
+            subprocess.run(
+                command
+                + [
+                    "plan",
+                    str(ROOT / "examples" / "work-plan.draft.json"),
+                    "--output",
+                    str(output),
                 ],
-                runtime_workers=runtime,
-            ),
-            self.roles,
-        )
-        execution = execution_record(
-            "test-plan",
-            [
-                {
-                    "task_id": "analysis-new-a1",
-                    "agent_type": "analyst",
-                    "worker_id": "worker-analysis",
-                    "runtime_ref": "/root/analysis_worker",
-                    "runtime_ref_source": "thread_status_metadata",
-                    "final_status": "completed",
-                    "active_after_close": False,
-                    "retired_from_followup": False,
-                    "retirement_source": "unknown",
-                }
-            ],
-        )
-        summary = work_plan.build_execution_summary(plan, execution, self.roles)
-        self.assertEqual(summary["workers"][0]["runtime_ref"], "/root/analysis_worker")
-        self.assertEqual(summary["workers"][0]["runtime_ref_source"], "thread_status_metadata")
-
-
-    def test_role_mismatch_retry_accepts_completed_worker_after_reclaim_ack(self) -> None:
-        runtime = [
-            {
-                "worker_id": "worker-pricing-a1",
-                "runtime_ref": None,
-                "runtime_ref_source": "unknown",
-                "task_id": "pricing-explain-a1",
-                "agent_type": "reviewer",
-                "status": "completed",
-                "retired_from_followup": True,
-                "retirement_source": "reclaim_response",
-                "read_paths": ["pricing.py", "rules.py", "test_pricing.py"],
-                "write_paths": [],
-            }
-        ]
-        prior = [
-            {
-                "task_id": "pricing-explain-a1",
-                "attempt": 1,
-                "status": "role_mismatch",
-                "worker_id": "worker-pricing-a1",
-            }
-        ]
-        payload = draft(
-            [
-                task(
-                    "pricing-explain-a2",
-                    "analyst",
-                    read_paths=["pricing.py", "rules.py", "test_pricing.py"],
-                    attempt=2,
-                    replaces="pricing-explain-a1",
-                )
-            ],
-            runtime_workers=runtime,
-            prior_tasks=prior,
-        )
-        result = work_plan.canonical_plan(payload, self.roles)
-        self.assertEqual(result["ready_task_ids"], ["pricing-explain-a2"])
-        self.assertEqual(result["runtime_workers"][0]["status"], "completed")
-        self.assertTrue(result["runtime_workers"][0]["retired_from_followup"])
-        self.assertEqual(result["superseded_worker_ids"], ["worker-pricing-a1"])
-        self.assertEqual(
-            result["runtime_workers"][0]["superseded_by_task_id"],
-            "pricing-explain-a2",
-        )
-
-    def test_retry_allows_inactive_completed_worker_without_retirement_evidence(self) -> None:
-        runtime = [
-            {
-                "worker_id": "worker-pricing-a1",
-                "runtime_ref": None,
-                "runtime_ref_source": "unknown",
-                "task_id": "pricing-explain-a1",
-                "agent_type": "reviewer",
-                "status": "completed",
-                "retired_from_followup": False,
-                "retirement_source": "unknown",
-                "read_paths": ["pricing.py"],
-                "write_paths": [],
-            }
-        ]
-        prior = [
-            {
-                "task_id": "pricing-explain-a1",
-                "attempt": 1,
-                "status": "role_mismatch",
-                "worker_id": "worker-pricing-a1",
-            }
-        ]
-        payload = draft(
-            [
-                task(
-                    "pricing-explain-a2",
-                    "analyst",
-                    read_paths=["pricing.py"],
-                    attempt=2,
-                    replaces="pricing-explain-a1",
-                )
-            ],
-            runtime_workers=runtime,
-            prior_tasks=prior,
-        )
-        result = work_plan.canonical_plan(payload, self.roles)
-        self.assertEqual(result["ready_task_ids"], ["pricing-explain-a2"])
-        self.assertEqual(result["superseded_worker_ids"], ["worker-pricing-a1"])
-        self.assertEqual(
-            result["runtime_workers"][0]["superseded_by_task_id"],
-            "pricing-explain-a2",
-        )
-        self.assertFalse(result["runtime_workers"][0]["retired_from_followup"])
-        self.assertEqual(result["runtime_workers"][0]["retirement_source"], "unknown")
-
-    def test_reuse_rejects_retired_completed_worker(self) -> None:
-        runtime = [
-            {
-                "worker_id": "worker-analysis",
-                "runtime_ref": None,
-                "runtime_ref_source": "unknown",
-                "task_id": "analysis-old-a1",
-                "agent_type": "analyst",
-                "status": "completed",
-                "retired_from_followup": True,
-                "retirement_source": "stop_response",
-                "read_paths": ["src"],
-                "write_paths": [],
-            }
-        ]
-        payload = draft(
-            [
-                task(
-                    "analysis-new-a1",
-                    "analyst",
-                    read_paths=["src"],
-                    reuse_worker_id="worker-analysis",
-                    accounting_scope="current_attempt_delta",
-                )
-            ],
-            runtime_workers=runtime,
-        )
-        with self.assertRaisesRegex(work_plan.PlanError, "retired from follow-up"):
-            work_plan.canonical_plan(payload, self.roles)
-
-    def test_reuse_rejects_superseded_completed_worker(self) -> None:
-        runtime = [
-            {
-                "worker_id": "worker-analysis",
-                "runtime_ref": None,
-                "runtime_ref_source": "unknown",
-                "task_id": "analysis-old-a1",
-                "agent_type": "analyst",
-                "status": "completed",
-                "retired_from_followup": False,
-                "retirement_source": "unknown",
-                "superseded_by_task_id": "analysis-retry-a2",
-                "read_paths": ["src"],
-                "write_paths": [],
-            }
-        ]
-        payload = draft(
-            [
-                task(
-                    "analysis-new-a1",
-                    "analyst",
-                    read_paths=["src"],
-                    reuse_worker_id="worker-analysis",
-                    accounting_scope="current_attempt_delta",
-                )
-            ],
-            runtime_workers=runtime,
-        )
-        with self.assertRaisesRegex(work_plan.PlanError, "superseded by analysis-retry-a2"):
-            work_plan.canonical_plan(payload, self.roles)
-
-    def test_replacement_attempt_must_use_fresh_worker(self) -> None:
-        runtime = [
-            {
-                "worker_id": "worker-old",
-                "runtime_ref": None,
-                "runtime_ref_source": "unknown",
-                "task_id": "old-task-a1",
-                "agent_type": "analyst",
-                "status": "completed",
-                "retired_from_followup": False,
-                "retirement_source": "unknown",
-                "read_paths": ["src"],
-                "write_paths": [],
-            },
-            {
-                "worker_id": "worker-other",
-                "runtime_ref": None,
-                "runtime_ref_source": "unknown",
-                "task_id": "other-task-a1",
-                "agent_type": "analyst",
-                "status": "completed",
-                "retired_from_followup": False,
-                "retirement_source": "unknown",
-                "read_paths": ["src"],
-                "write_paths": [],
-            },
-        ]
-        prior = [
-            {
-                "task_id": "old-task-a1",
-                "attempt": 1,
-                "status": "role_mismatch",
-                "worker_id": "worker-old",
-            }
-        ]
-        payload = draft(
-            [
-                task(
-                    "new-task-a2",
-                    "analyst",
-                    read_paths=["src"],
-                    attempt=2,
-                    replaces="old-task-a1",
-                    reuse_worker_id="worker-other",
-                    accounting_scope="current_attempt_delta",
-                )
-            ],
-            runtime_workers=runtime,
-            prior_tasks=prior,
-        )
-        with self.assertRaisesRegex(work_plan.PlanError, "replacement attempt must use a fresh Worker"):
-            work_plan.canonical_plan(payload, self.roles)
-
-    def test_active_worker_cannot_be_predeclared_superseded(self) -> None:
-        runtime = [
-            {
-                "worker_id": "worker-live",
-                "runtime_ref": None,
-                "runtime_ref_source": "unknown",
-                "task_id": "live-task-a1",
-                "agent_type": "analyst",
-                "status": "running",
-                "retired_from_followup": False,
-                "retirement_source": "unknown",
-                "superseded_by_task_id": "future-task-a2",
-                "read_paths": ["src"],
-                "write_paths": [],
-            }
-        ]
-        payload = draft([task("scan-a1", "analyst", read_paths=["src/next"])], runtime_workers=runtime)
-        with self.assertRaisesRegex(work_plan.PlanError, "cannot be superseded"):
-            work_plan.canonical_plan(payload, self.roles)
-
-    def test_unknown_superseded_task_id_is_rejected(self) -> None:
-        runtime = [
-            {
-                "worker_id": "worker-old",
-                "runtime_ref": None,
-                "runtime_ref_source": "unknown",
-                "task_id": "old-task-a1",
-                "agent_type": "analyst",
-                "status": "completed",
-                "retired_from_followup": False,
-                "retirement_source": "unknown",
-                "superseded_by_task_id": "missing-task-a2",
-                "read_paths": ["src"],
-                "write_paths": [],
-            }
-        ]
-        payload = draft([task("scan-a1", "analyst", read_paths=["src/next"])], runtime_workers=runtime)
-        with self.assertRaisesRegex(work_plan.PlanError, "unknown superseded_by_task_id"):
-            work_plan.canonical_plan(payload, self.roles)
-
-    def test_second_replacement_of_same_worker_is_rejected(self) -> None:
-        runtime = [
-            {
-                "worker_id": "worker-old",
-                "runtime_ref": None,
-                "runtime_ref_source": "unknown",
-                "task_id": "old-task-a1",
-                "agent_type": "analyst",
-                "status": "completed",
-                "retired_from_followup": False,
-                "retirement_source": "unknown",
-                "superseded_by_task_id": "first-replacement-a2",
-                "read_paths": ["src"],
-                "write_paths": [],
-            }
-        ]
-        prior = [
-            {
-                "task_id": "old-task-a1",
-                "attempt": 1,
-                "status": "role_mismatch",
-                "worker_id": "worker-old",
-            }
-        ]
-        payload = draft(
-            [
-                task(
-                    "second-replacement-a2",
-                    "analyst",
-                    read_paths=["src"],
-                    attempt=2,
-                    replaces="old-task-a1",
-                )
-            ],
-            runtime_workers=runtime,
-            prior_tasks=prior,
-        )
-        with self.assertRaisesRegex(work_plan.PlanError, "already superseded by first-replacement-a2"):
-            work_plan.canonical_plan(payload, self.roles)
-
-    def test_retirement_provenance_pairs_are_enforced(self) -> None:
-        runtime = [
-            {
-                "worker_id": "worker-old",
-                "runtime_ref": None,
-                "runtime_ref_source": "unknown",
-                "task_id": "old-task-a1",
-                "agent_type": "analyst",
-                "status": "completed",
-                "retired_from_followup": True,
-                "retirement_source": "unknown",
-                "read_paths": ["src"],
-                "write_paths": [],
-            }
-        ]
-        payload = draft([task("scan-a1", "analyst", read_paths=["src/next"])], runtime_workers=runtime)
-        with self.assertRaisesRegex(work_plan.PlanError, "requires stop_response"):
-            work_plan.canonical_plan(payload, self.roles)
-
-        runtime[0]["retired_from_followup"] = False
-        runtime[0]["retirement_source"] = "stop_response"
-        with self.assertRaisesRegex(work_plan.PlanError, "must be unknown"):
-            work_plan.canonical_plan(payload, self.roles)
-
-        runtime[0]["retired_from_followup"] = True
-        runtime[0]["retirement_source"] = "runtime_terminal_status"
-        with self.assertRaisesRegex(work_plan.PlanError, "invalid for status=completed"):
-            work_plan.canonical_plan(payload, self.roles)
-
-        runtime[0]["status"] = "running"
-        runtime[0]["retirement_source"] = "stop_response"
-        with self.assertRaisesRegex(work_plan.PlanError, "cannot be retired"):
-            work_plan.canonical_plan(payload, self.roles)
-
-        runtime[0]["status"] = "stopped"
-        runtime[0]["retired_from_followup"] = False
-        runtime[0]["retirement_source"] = "unknown"
-        with self.assertRaisesRegex(work_plan.PlanError, "terminal and requires"):
-            work_plan.canonical_plan(payload, self.roles)
-
-        runtime[0]["status"] = "completed"
-        runtime[0]["retired_from_followup"] = True
-        runtime[0]["retirement_source"] = "stop_response"
-        result = work_plan.canonical_plan(payload, self.roles)
-        self.assertEqual(result["runtime_workers"][0]["retirement_source"], "stop_response")
-
-    def test_execution_summary_renders_retirement_evidence(self) -> None:
-        plan = work_plan.canonical_plan(
-            draft([task("scan-a1", "default", read_paths=["."])]),
-            self.roles,
-        )
-        execution = execution_record(
-            "test-plan",
-            [
-                {
-                    "task_id": "scan-a1",
-                    "agent_type": "default",
-                    "worker_id": "worker-scan-a1",
-                    "runtime_ref": None,
-                    "runtime_ref_source": "unknown",
-                    "final_status": "completed",
-                    "active_after_close": False,
-                    "retired_from_followup": True,
-                    "retirement_source": "reclaim_response",
-                }
-            ],
-        )
-        summary = work_plan.build_execution_summary(plan, execution, self.roles)
-        text = work_plan.render_execution_summary(summary)
-        self.assertIn("retired_from_followup: true", text)
-        self.assertIn("retirement_source: reclaim_response", text)
+                check=True,
+            )
+            subprocess.run(command + ["validate", str(output)], check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(
+                command
+                + [
+                    "summary",
+                    str(output),
+                    str(ROOT / "examples" / "work-plan.execution.json"),
+                    "--json",
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                command
+                + [
+                    "digest",
+                    "--entry",
+                    str(output),
+                    str(ROOT / "examples" / "work-plan.execution.json"),
+                    "--json",
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+            dispatch_path = Path(directory) / "dispatch.json"
+            dispatch_path.write_text(
+                json.dumps(
+                    {
+                        "method": "followup_task",
+                        "task_name": "分析认证缓存根因",
+                        "agent_type": "analyst",
+                        "fork_turns": None,
+                        "model": None,
+                        "reasoning_effort": None,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            subprocess.run(
+                command
+                + [
+                    "guard-dispatch",
+                    str(output),
+                    "auth-cause-a1",
+                    str(dispatch_path),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+            subprocess.run(command + ["doctor", "--json"], check=True, stdout=subprocess.DEVNULL)
 
 
 if __name__ == "__main__":

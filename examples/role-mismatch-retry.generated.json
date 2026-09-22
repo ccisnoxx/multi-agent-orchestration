@@ -1,11 +1,37 @@
 {
-  "version": 4,
-  "planner_version": "1.4.0",
+  "version": 5,
+  "planner_version": "1.5.0",
   "plan_id": "role-mismatch-retry",
   "max_concurrent_workers": 2,
   "effective_capacity": 2,
   "open_workers": 0,
   "available_slots": 2,
+  "role_profiles": {
+    "analyst": {
+      "name": "analyst",
+      "model": "gpt-5.6-sol",
+      "model_reasoning_effort": "high",
+      "sandbox_mode": "read-only",
+      "profile_source": "agent_toml",
+      "config_file": "analyst.toml",
+      "config_sha256": "7cf1d3dbb1966bb37abd806cb9b928ddb25fd9b7aa7ae44a3aa13a2672e14e95"
+    },
+    "reviewer": {
+      "name": "reviewer",
+      "model": "gpt-5.6-sol",
+      "model_reasoning_effort": "high",
+      "sandbox_mode": "read-only",
+      "profile_source": "agent_toml",
+      "config_file": "reviewer.toml",
+      "config_sha256": "422aa163c7dfec439046340f7c91f4aa088d57c0007cc82d65859d0fd482e6ee"
+    }
+  },
+  "codex_config_evidence": {
+    "config_file": "config.toml",
+    "config_sha256": "74664cc6a96353951834dc72029a5facd6598a8c474c17a0c4815a6830cde2dc",
+    "configured_max_concurrent_threads_per_session": 4,
+    "capacity_source": "codex_config"
+  },
   "runtime_workers": [
     {
       "worker_id": "worker-pricing-explain-a1",
@@ -18,7 +44,6 @@
       "retirement_source": "unknown",
       "superseded_by_task_id": "pricing-explain-a2",
       "read_paths": [
-        "AGENTS.md",
         "pricing.py",
         "rules.py",
         "test_pricing.py"
@@ -43,7 +68,6 @@
       "replaces_task_id": "pricing-explain-a1",
       "depends_on": [],
       "read_paths": [
-        "AGENTS.md",
         "pricing.py",
         "rules.py",
         "test_pricing.py"
@@ -53,9 +77,13 @@
       "review_of_task_ids": [],
       "reuse_worker_id": null,
       "accounting_scope": "not_available",
-      "deliverable": "解释 quote(100)=105 的当前跨模块因果链、权威定义和测试证据。",
+      "dispatch_method": "spawn_agent",
+      "fork_turns": "none",
+      "delivery_mode": "complete_task",
+      "progress_policy": "blocker_or_final",
+      "deliverable": "解释 quote(100)=105 的当前跨模块因果链和测试证据。",
       "acceptance_criteria": [
-        "使用新 task_id",
+        "使用 fresh Worker",
         "给出准确 file:line",
         "区分事实、推断和证据缺口",
         "不修改文件"

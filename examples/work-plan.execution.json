@@ -1,21 +1,25 @@
 {
-  "version": 3,
+  "version": 6,
   "plan_id": "auth-cache-fix",
   "plan_command": [
     "./bin/work-plan",
     "--agents-dir",
-    "$HOME/.codex/agents",
+    "examples/agents",
+    "--codex-config",
+    "examples/config.toml",
     "plan",
     "examples/work-plan.draft.json",
     "--output",
-    "/tmp/work-plan.json"
+    "examples/work-plan.generated.json"
   ],
   "validate_command": [
     "./bin/work-plan",
     "--agents-dir",
-    "$HOME/.codex/agents",
+    "examples/agents",
+    "--codex-config",
+    "examples/config.toml",
     "validate",
-    "/tmp/work-plan.json"
+    "examples/work-plan.generated.json"
   ],
   "validate_status": "passed",
   "workers": [
@@ -26,11 +30,27 @@
       "runtime_ref": "/root/worker_old_analysis",
       "runtime_ref_source": "thread_status_metadata",
       "final_status": "completed",
+      "task_outcome": "accepted",
       "active_after_close": false,
-      "retired_from_followup": true,
-      "retirement_source": "reclaim_response"
+      "retired_from_followup": false,
+      "retirement_source": "unknown",
+      "observed_dispatch": {
+        "method": "followup_task",
+        "task_name": "分析认证缓存根因",
+        "fork_turns": null,
+        "model_override": null,
+        "reasoning_effort_override": null
+      },
+      "observed_write_paths": [],
+      "parent_followup_count": 0,
+      "worker_intermediate_message_count": 0
     }
   ],
   "active_worker_ids_after_execution": [],
-  "writes_observed": false
+  "writes_observed": false,
+  "communication": {
+    "wait_call_count": 1,
+    "wait_timeout_count": 0,
+    "status_poll_count": 0
+  }
 }

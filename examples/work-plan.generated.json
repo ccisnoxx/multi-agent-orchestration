@@ -1,11 +1,46 @@
 {
-  "version": 3,
-  "planner_version": "1.3.0",
+  "version": 5,
+  "planner_version": "1.5.0",
   "plan_id": "auth-cache-fix",
   "max_concurrent_workers": 3,
   "effective_capacity": 3,
   "open_workers": 0,
   "available_slots": 3,
+  "role_profiles": {
+    "analyst": {
+      "name": "analyst",
+      "model": "gpt-5.6-sol",
+      "model_reasoning_effort": "high",
+      "sandbox_mode": "read-only",
+      "profile_source": "agent_toml",
+      "config_file": "analyst.toml",
+      "config_sha256": "7cf1d3dbb1966bb37abd806cb9b928ddb25fd9b7aa7ae44a3aa13a2672e14e95"
+    },
+    "debugger": {
+      "name": "debugger",
+      "model": "gpt-5.6-sol",
+      "model_reasoning_effort": "high",
+      "sandbox_mode": "workspace-write",
+      "profile_source": "agent_toml",
+      "config_file": "debugger.toml",
+      "config_sha256": "f10927c79ebb3c1a191bc91d1d2f85373ce63a57b81bcc0fa3aa1a7f66d3a4be"
+    },
+    "reviewer": {
+      "name": "reviewer",
+      "model": "gpt-5.6-sol",
+      "model_reasoning_effort": "high",
+      "sandbox_mode": "read-only",
+      "profile_source": "agent_toml",
+      "config_file": "reviewer.toml",
+      "config_sha256": "422aa163c7dfec439046340f7c91f4aa088d57c0007cc82d65859d0fd482e6ee"
+    }
+  },
+  "codex_config_evidence": {
+    "config_file": "config.toml",
+    "config_sha256": "74664cc6a96353951834dc72029a5facd6598a8c474c17a0c4815a6830cde2dc",
+    "configured_max_concurrent_threads_per_session": 4,
+    "capacity_source": "codex_config"
+  },
   "runtime_workers": [
     {
       "worker_id": "worker-old-analysis",
@@ -16,6 +51,7 @@
       "status": "completed",
       "retired_from_followup": false,
       "retirement_source": "unknown",
+      "superseded_by_task_id": null,
       "read_paths": [
         "src/auth"
       ],
@@ -40,10 +76,14 @@
       "review_of_task_ids": [],
       "reuse_worker_id": "worker-old-analysis",
       "accounting_scope": "current_attempt_delta",
-      "deliverable": "定位缓存失效的权威所有者、因果链和最小修复边界。",
+      "dispatch_method": "followup_task",
+      "fork_turns": null,
+      "delivery_mode": "complete_task",
+      "progress_policy": "blocker_or_final",
+      "deliverable": "解释缓存失效根因、权威所有者和最小修复边界。",
       "acceptance_criteria": [
-        "提供准确的文件与符号位置",
-        "区分已证实事实、推断和证据缺口"
+        "给出准确的文件与符号位置",
+        "区分事实、推断和证据缺口"
       ],
       "assigned_wave": 1
     },
@@ -68,7 +108,11 @@
       "review_of_task_ids": [],
       "reuse_worker_id": null,
       "accounting_scope": "not_available",
-      "deliverable": "在权威所有者处修复根因并添加最小稳定回归测试。",
+      "dispatch_method": "spawn_agent",
+      "fork_turns": "none",
+      "delivery_mode": "complete_task",
+      "progress_policy": "blocker_or_final",
+      "deliverable": "完成根因修复、目标回归测试和本次修改导致问题的修正。",
       "acceptance_criteria": [
         "修改前的失败行为有证据",
         "目标测试通过",
@@ -94,10 +138,14 @@
       ],
       "reuse_worker_id": null,
       "accounting_scope": "not_available",
+      "dispatch_method": "spawn_agent",
+      "fork_turns": "none",
+      "delivery_mode": "complete_task",
+      "progress_policy": "blocker_or_final",
       "deliverable": "独立检查实际 diff、回归风险和验证缺口。",
       "acceptance_criteria": [
-        "每项发现包含触发条件和准确位置",
-        "没有确认问题时说明检查范围和未覆盖风险"
+        "发现包含触发条件和准确位置",
+        "无确认问题时说明检查范围和未覆盖风险"
       ],
       "assigned_wave": 3
     }
@@ -130,5 +178,6 @@
     "auth-review-a1"
   ],
   "blocked_task_ids": [],
-  "blocked_reasons": {}
+  "blocked_reasons": {},
+  "superseded_worker_ids": []
 }

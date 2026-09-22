@@ -1,5 +1,5 @@
 {
-  "version": 4,
+  "version": 5,
   "plan_id": "role-mismatch-retry",
   "max_concurrent_workers": 2,
   "runtime_workers": [
@@ -12,14 +12,9 @@
       "status": "completed",
       "retired_from_followup": false,
       "retirement_source": "unknown",
-      "read_paths": [
-        "AGENTS.md",
-        "pricing.py",
-        "rules.py",
-        "test_pricing.py"
-      ],
-      "write_paths": [],
-      "superseded_by_task_id": null
+      "superseded_by_task_id": null,
+      "read_paths": ["pricing.py", "rules.py", "test_pricing.py"],
+      "write_paths": []
     }
   ],
   "prior_tasks": [
@@ -38,20 +33,19 @@
       "attempt": 2,
       "replaces_task_id": "pricing-explain-a1",
       "depends_on": [],
-      "read_paths": [
-        "AGENTS.md",
-        "pricing.py",
-        "rules.py",
-        "test_pricing.py"
-      ],
+      "read_paths": ["pricing.py", "rules.py", "test_pricing.py"],
       "write_paths": [],
       "independent_review": false,
       "review_of_task_ids": [],
       "reuse_worker_id": null,
       "accounting_scope": "not_available",
-      "deliverable": "解释 quote(100)=105 的当前跨模块因果链、权威定义和测试证据。",
+      "dispatch_method": "spawn_agent",
+      "fork_turns": "none",
+      "delivery_mode": "complete_task",
+      "progress_policy": "blocker_or_final",
+      "deliverable": "解释 quote(100)=105 的当前跨模块因果链和测试证据。",
       "acceptance_criteria": [
-        "使用新 task_id",
+        "使用 fresh Worker",
         "给出准确 file:line",
         "区分事实、推断和证据缺口",
         "不修改文件"

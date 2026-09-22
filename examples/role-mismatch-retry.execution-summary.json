@@ -1,0 +1,101 @@
+{
+  "summary_type": "WORKPLAN_EXECUTION_SUMMARY",
+  "summary_version": 3,
+  "planner_version": "1.5.0",
+  "plan_id": "role-mismatch-retry",
+  "plan_command": [
+    "./bin/work-plan",
+    "--agents-dir",
+    "examples/agents",
+    "--codex-config",
+    "examples/config.toml",
+    "plan",
+    "examples/role-mismatch-retry.draft.json",
+    "--output",
+    "examples/role-mismatch-retry.generated.json"
+  ],
+  "validate_command": [
+    "./bin/work-plan",
+    "--agents-dir",
+    "examples/agents",
+    "--codex-config",
+    "examples/config.toml",
+    "validate",
+    "examples/role-mismatch-retry.generated.json"
+  ],
+  "validate_status": "passed",
+  "codex_config_evidence": {
+    "config_file": "config.toml",
+    "config_sha256": "74664cc6a96353951834dc72029a5facd6598a8c474c17a0c4815a6830cde2dc",
+    "configured_max_concurrent_threads_per_session": 4,
+    "capacity_source": "codex_config"
+  },
+  "effective_capacity": 2,
+  "open_workers_at_plan_time": 0,
+  "available_slots_at_plan_time": 2,
+  "waves": [
+    {
+      "wave": 1,
+      "task_ids": [
+        "pricing-explain-a2"
+      ]
+    }
+  ],
+  "ready_task_ids": [
+    "pricing-explain-a2"
+  ],
+  "executed_task_ids": [
+    "pricing-explain-a2"
+  ],
+  "not_executed_ready_task_ids": [],
+  "superseded_worker_ids": [
+    "worker-pricing-explain-a1"
+  ],
+  "workers": [
+    {
+      "task_id": "pricing-explain-a2",
+      "agent_type": "analyst",
+      "worker_id": "worker-pricing-explain-a2",
+      "runtime_ref": null,
+      "runtime_ref_source": "unknown",
+      "final_status": "completed",
+      "task_outcome": "accepted",
+      "active_after_close": false,
+      "retired_from_followup": false,
+      "retirement_source": "unknown",
+      "observed_dispatch": {
+        "method": "spawn_agent",
+        "task_name": "分析价格计算链",
+        "fork_turns": "none",
+        "model_override": null,
+        "reasoning_effort_override": null
+      },
+      "observed_write_paths": [],
+      "parent_followup_count": 0,
+      "worker_intermediate_message_count": 0,
+      "task_name": "分析价格计算链",
+      "independent_review": false,
+      "planned_write_paths": [],
+      "configured_model": "gpt-5.6-sol",
+      "configured_model_reasoning_effort": "high",
+      "configured_sandbox_mode": "read-only",
+      "profile_source": "agent_toml",
+      "profile_file": "analyst.toml",
+      "profile_sha256": "7cf1d3dbb1966bb37abd806cb9b928ddb25fd9b7aa7ae44a3aa13a2672e14e95"
+    }
+  ],
+  "dispatch_counts": {
+    "fresh_spawn_count": 1,
+    "reused_followup_count": 0,
+    "isolated_fork_count": 1
+  },
+  "communication": {
+    "status_poll_count": 0,
+    "wait_call_count": 1,
+    "wait_timeout_count": 0
+  },
+  "unknown_write_path_task_ids": [],
+  "active_workers_after_execution": 0,
+  "active_worker_ids_after_execution": [],
+  "writes_observed": false
+}

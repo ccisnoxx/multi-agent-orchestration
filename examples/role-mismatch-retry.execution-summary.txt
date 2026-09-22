@@ -1,22 +1,22 @@
 WORKPLAN_EXECUTION_SUMMARY
 summary_version: 3
 planner_version: 1.5.0
-plan_id: auth-cache-fix
+plan_id: role-mismatch-retry
 validate_status: passed
-plan_command: ["./bin/work-plan", "--agents-dir", "examples/agents", "--codex-config", "examples/config.toml", "plan", "examples/work-plan.draft.json", "--output", "examples/work-plan.generated.json"]
-validate_command: ["./bin/work-plan", "--agents-dir", "examples/agents", "--codex-config", "examples/config.toml", "validate", "examples/work-plan.generated.json"]
+plan_command: ["./bin/work-plan", "--agents-dir", "examples/agents", "--codex-config", "examples/config.toml", "plan", "examples/role-mismatch-retry.draft.json", "--output", "examples/role-mismatch-retry.generated.json"]
+validate_command: ["./bin/work-plan", "--agents-dir", "examples/agents", "--codex-config", "examples/config.toml", "validate", "examples/role-mismatch-retry.generated.json"]
 codex_config_evidence: {"config_file": "config.toml", "config_sha256": "74664cc6a96353951834dc72029a5facd6598a8c474c17a0c4815a6830cde2dc", "configured_max_concurrent_threads_per_session": 4, "capacity_source": "codex_config"}
-effective_capacity: 3
+effective_capacity: 2
 open_workers_at_plan_time: 0
-available_slots_at_plan_time: 3
-waves: [{"wave": 1, "task_ids": ["auth-cause-a1"]}, {"wave": 2, "task_ids": ["auth-fix-a1"]}, {"wave": 3, "task_ids": ["auth-review-a1"]}]
-ready_task_ids: ["auth-cause-a1"]
-executed_task_ids: ["auth-cause-a1"]
+available_slots_at_plan_time: 2
+waves: [{"wave": 1, "task_ids": ["pricing-explain-a2"]}]
+ready_task_ids: ["pricing-explain-a2"]
+executed_task_ids: ["pricing-explain-a2"]
 not_executed_ready_task_ids: []
-superseded_worker_ids: []
+superseded_worker_ids: ["worker-pricing-explain-a1"]
 workers:
-  - task_id: auth-cause-a1
-    task_name: "分析认证缓存根因"
+  - task_id: pricing-explain-a2
+    task_name: "分析价格计算链"
     agent_type: analyst
     independent_review: false
     configured_model: "gpt-5.6-sol"
@@ -24,10 +24,10 @@ workers:
     configured_sandbox_mode: read-only
     profile_file: "analyst.toml"
     profile_sha256: 7cf1d3dbb1966bb37abd806cb9b928ddb25fd9b7aa7ae44a3aa13a2672e14e95
-    worker_id: worker-old-analysis
-    runtime_ref: "/root/worker_old_analysis"
-    runtime_ref_source: thread_status_metadata
-    observed_dispatch: {"method": "followup_task", "task_name": "分析认证缓存根因", "fork_turns": null, "model_override": null, "reasoning_effort_override": null}
+    worker_id: worker-pricing-explain-a2
+    runtime_ref: unknown
+    runtime_ref_source: unknown
+    observed_dispatch: {"method": "spawn_agent", "task_name": "分析价格计算链", "fork_turns": "none", "model_override": null, "reasoning_effort_override": null}
     planned_write_paths: []
     observed_write_paths: []
     final_status: completed
@@ -37,7 +37,7 @@ workers:
     retirement_source: unknown
     parent_followup_count: 0
     worker_intermediate_message_count: 0
-dispatch_counts: {"fresh_spawn_count": 0, "reused_followup_count": 1, "isolated_fork_count": 0}
+dispatch_counts: {"fresh_spawn_count": 1, "reused_followup_count": 0, "isolated_fork_count": 1}
 communication: {"status_poll_count": 0, "wait_call_count": 1, "wait_timeout_count": 0}
 unknown_write_path_task_ids: []
 active_workers_after_execution: 0

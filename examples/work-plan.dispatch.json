@@ -1,0 +1,8 @@
+{
+  "method": "followup_task",
+  "task_name": "分析认证缓存根因",
+  "agent_type": "analyst",
+  "fork_turns": null,
+  "model": null,
+  "reasoning_effort": null
+}

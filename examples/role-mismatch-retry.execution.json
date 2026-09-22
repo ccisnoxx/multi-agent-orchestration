@@ -1,8 +1,26 @@
 {
-  "version": 4,
+  "version": 6,
   "plan_id": "role-mismatch-retry",
-  "plan_command": ["./bin/work-plan", "--agents-dir", "/tmp/agents", "plan", "examples/role-mismatch-retry.draft.json", "--output", "/tmp/role-mismatch-retry-v14.json"],
-  "validate_command": ["./bin/work-plan", "--agents-dir", "/tmp/agents", "validate", "/tmp/role-mismatch-retry-v14.json"],
+  "plan_command": [
+    "./bin/work-plan",
+    "--agents-dir",
+    "examples/agents",
+    "--codex-config",
+    "examples/config.toml",
+    "plan",
+    "examples/role-mismatch-retry.draft.json",
+    "--output",
+    "examples/role-mismatch-retry.generated.json"
+  ],
+  "validate_command": [
+    "./bin/work-plan",
+    "--agents-dir",
+    "examples/agents",
+    "--codex-config",
+    "examples/config.toml",
+    "validate",
+    "examples/role-mismatch-retry.generated.json"
+  ],
   "validate_status": "passed",
   "workers": [
     {
@@ -12,11 +30,27 @@
       "runtime_ref": null,
       "runtime_ref_source": "unknown",
       "final_status": "completed",
+      "task_outcome": "accepted",
       "active_after_close": false,
       "retired_from_followup": false,
-      "retirement_source": "unknown"
+      "retirement_source": "unknown",
+      "observed_dispatch": {
+        "method": "spawn_agent",
+        "task_name": "分析价格计算链",
+        "fork_turns": "none",
+        "model_override": null,
+        "reasoning_effort_override": null
+      },
+      "observed_write_paths": [],
+      "parent_followup_count": 0,
+      "worker_intermediate_message_count": 0
     }
   ],
   "active_worker_ids_after_execution": [],
-  "writes_observed": false
+  "writes_observed": false,
+  "communication": {
+    "wait_call_count": 1,
+    "wait_timeout_count": 0,
+    "status_poll_count": 0
+  }
 }

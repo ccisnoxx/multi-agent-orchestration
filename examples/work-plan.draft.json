@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 5,
   "plan_id": "auth-cache-fix",
   "max_concurrent_workers": 3,
   "runtime_workers": [
@@ -12,9 +12,8 @@
       "status": "completed",
       "retired_from_followup": false,
       "retirement_source": "unknown",
-      "read_paths": [
-        "src/auth"
-      ],
+      "superseded_by_task_id": null,
+      "read_paths": ["src/auth"],
       "write_paths": []
     }
   ],
@@ -27,19 +26,20 @@
       "attempt": 1,
       "replaces_task_id": null,
       "depends_on": [],
-      "read_paths": [
-        "src/auth",
-        "tests/auth"
-      ],
+      "read_paths": ["src/auth", "tests/auth"],
       "write_paths": [],
       "independent_review": false,
       "review_of_task_ids": [],
       "reuse_worker_id": "worker-old-analysis",
       "accounting_scope": "current_attempt_delta",
-      "deliverable": "定位缓存失效的权威所有者、因果链和最小修复边界。",
+      "dispatch_method": "followup_task",
+      "fork_turns": null,
+      "delivery_mode": "complete_task",
+      "progress_policy": "blocker_or_final",
+      "deliverable": "解释缓存失效根因、权威所有者和最小修复边界。",
       "acceptance_criteria": [
-        "提供准确的文件与符号位置",
-        "区分已证实事实、推断和证据缺口"
+        "给出准确的文件与符号位置",
+        "区分事实、推断和证据缺口"
       ]
     },
     {
@@ -48,22 +48,18 @@
       "agent_type": "debugger",
       "attempt": 1,
       "replaces_task_id": null,
-      "depends_on": [
-        "auth-cause-a1"
-      ],
-      "read_paths": [
-        "src/auth",
-        "tests/auth"
-      ],
-      "write_paths": [
-        "src/auth/cache.py",
-        "tests/auth/test_cache.py"
-      ],
+      "depends_on": ["auth-cause-a1"],
+      "read_paths": ["src/auth", "tests/auth"],
+      "write_paths": ["src/auth/cache.py", "tests/auth/test_cache.py"],
       "independent_review": false,
       "review_of_task_ids": [],
       "reuse_worker_id": null,
       "accounting_scope": "not_available",
-      "deliverable": "在权威所有者处修复根因并添加最小稳定回归测试。",
+      "dispatch_method": "spawn_agent",
+      "fork_turns": "none",
+      "delivery_mode": "complete_task",
+      "progress_policy": "blocker_or_final",
+      "deliverable": "完成根因修复、目标回归测试和本次修改导致问题的修正。",
       "acceptance_criteria": [
         "修改前的失败行为有证据",
         "目标测试通过",
@@ -77,21 +73,20 @@
       "attempt": 1,
       "replaces_task_id": null,
       "depends_on": [],
-      "read_paths": [
-        "src/auth",
-        "tests/auth"
-      ],
+      "read_paths": ["src/auth", "tests/auth"],
       "write_paths": [],
       "independent_review": true,
-      "review_of_task_ids": [
-        "auth-fix-a1"
-      ],
+      "review_of_task_ids": ["auth-fix-a1"],
       "reuse_worker_id": null,
       "accounting_scope": "not_available",
+      "dispatch_method": "spawn_agent",
+      "fork_turns": "none",
+      "delivery_mode": "complete_task",
+      "progress_policy": "blocker_or_final",
       "deliverable": "独立检查实际 diff、回归风险和验证缺口。",
       "acceptance_criteria": [
-        "每项发现包含触发条件和准确位置",
-        "没有确认问题时说明检查范围和未覆盖风险"
+        "发现包含触发条件和准确位置",
+        "无确认问题时说明检查范围和未覆盖风险"
       ]
     }
   ]

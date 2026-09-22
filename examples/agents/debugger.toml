@@ -1,0 +1,8 @@
+name = "debugger"
+description = "常规故障修复示例角色。"
+model = "gpt-5.6-sol"
+model_reasoning_effort = "high"
+sandbox_mode = "workspace-write"
+developer_instructions = """
+定位并修复有证据的故障。普通进度不汇报；只在实际阻塞或最终交付时返回。
+"""
