@@ -23,6 +23,8 @@
 
 - `SKILL.md`：委派、路由、完整任务合同、生命周期、通信和验收流程；
 - `scripts/work_plan.py`：确定性计划、配置、身份、执行证据和摘要校验；
+- `scripts/subagent_spawn_policy_hook.py` / `bin/subagent-spawn-policy-hook`：无状态的通用 spawn 策略门禁；
+- `examples/hooks.user.json`：用户级 Codex PreToolUse Hook 配置模板；
 - `references/work-plan.md`：完整协议；
 - `examples/`：可实际运行的 schema 5/6 示例；
 - `tests/`：单元与端到端测试；
@@ -82,6 +84,24 @@ uv pip install \
 ```bash
 ./bin/regenerate-examples
 ```
+
+## 用户级 spawn Hook
+
+将 `examples/hooks.user.json` 安装到 `~/.codex/hooks.json`，已有文件先做带时间戳的备份，
+将 command 替换为 `bin/subagent-spawn-policy-hook` 的绝对路径；入口权限为 `755`，
+配置权限为 `600`。完整可复制步骤见[使用指南](docs/USAGE_AND_AUDIT_GUIDE.md#51-用户级-pretooluse-hook)。
+不需要修改 `config.toml`。安装后启动新 Codex 会话，在 `/hooks` 中确认至少一个
+`PreToolUse` 条目并审查和信任；安装文件不等于启用，不能自动绕过 Hook trust。
+
+Hook 从 stdin 读取 JSON，对 `spawn_agent`、`Agent` 和以 `spawn_agent` 结尾的 namespaced
+工具要求非空字符串 `task_name`、`agent_type`，以及显式 `fork_turns: "none"`，禁止
+`tool_input` 内非空的 `model`、`reasoning_effort`、`model_reasoning_effort`。Hook 顶层
+`model` 不属于覆盖。合法调用静默退出 `0`；拒绝、非法 JSON 或 spawn 的 `tool_input`
+不是 object 时向 stderr 输出原因并退出 `2`；其他工具退出 `0`。
+
+这是通用 spawn 策略门禁。WorkPlan `guard-dispatch` 仍负责 ready_task、stage、audit 和
+fresh/reuse 合同。specialized tool path 可能绕过 Hook，不能删除执行后审计。
+Codex 的加载、信任和工具覆盖边界见 [OpenAI Hooks 文档](https://learn.chatgpt.com/docs/hooks)。
 
 ## 持久化审计目录
 

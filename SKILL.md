@@ -112,7 +112,7 @@ Planner 不创建 Worker、不调用模型、不联网、不修改目标仓库�
 
 - 始终显式指定 `agent_type`；不依赖默认角色；
 - fresh Worker 始终显式使用 `fork_turns: "none"`；
-- 不传 `model` 或 `reasoning_effort` 覆盖；
+- 不传 `model`、`reasoning_effort` 或 `model_reasoning_effort` 覆盖；
 - 只派发生成计划中的 `ready_task_ids`；
 - task message 必须在没有父线程历史时仍然完整可执行；
 - 普通进度不汇报，只在实际阻塞、需要共同决定、所有权冲突、影响其他任务或最终交付时发消息；
@@ -221,9 +221,28 @@ $AUDIT_DIR/SUBAGENT_EXECUTION_DIGEST.md
   --audit "$AUDIT_ID"
 ```
 
-`guard-dispatch` 是与 hook 传输格式解耦的派发前门禁。hook 必须先把实际工具参数写入当前 Bundle 对应 stage 的 dispatch 目录，再传入 `--audit`。门禁除了拒绝非 ready task、错误角色、`fork_turns: "all"` 和模型/effort 覆盖，还会拒绝不在持久化 Bundle 中、或 plan 与 dispatch 不属于同一 stage 的调用。不得仅在 `/tmp` 中准备派发证据后绕过此门禁。
+`guard-dispatch` 是与 Hook 传输格式解耦的派发前门禁。主代理必须先把实际工具参数写入当前 Bundle 对应 stage 的 dispatch 目录，再传入 `--audit`。门禁除了拒绝非 ready task、错误角色、`fork_turns: "all"` 和模型/effort 覆盖，还会拒绝不在持久化 Bundle 中、或 plan 与 dispatch 不属于同一 stage 的调用。不得仅在 `/tmp` 中准备派发证据后绕过此门禁。
 
 WorkPlan schema、字段、执行记录和示例见 `references/work-plan.md`。
+
+## 用户级 PreToolUse Hook
+
+`bin/subagent-spawn-policy-hook` 是无状态的通用 spawn 策略门禁，读取 stdin 中的 Codex
+PreToolUse JSON，检查 `spawn_agent`、`Agent` 和以 `spawn_agent` 结尾的 namespaced 工具。
+要求 `task_name`、`agent_type` 为非空字符串，`fork_turns` 显式为 `"none"`，并禁止
+`tool_input` 内非空的 `model`、`reasoning_effort`、`model_reasoning_effort`；顶层 `model`
+是事件元数据，不算派发覆盖。合法调用静默退出 `0`，策略拒绝、非法 JSON 或 spawn
+的 `tool_input` 不是 object 时向 stderr 输出原因并退出 `2`；其他工具退出 `0`。
+
+从 `examples/hooks.user.json` 安装到 `~/.codex/hooks.json`，先备份已有文件，command
+使用入口的绝对路径。入口权限设为 `755`，配置权限设为 `600`。新会话中必须通过
+`/hooks` 审查和信任；不得自动绕过 Hook trust。详细步骤见
+[`docs/USAGE_AND_AUDIT_GUIDE.md`](docs/USAGE_AND_AUDIT_GUIDE.md#51-用户级-pretooluse-hook)。
+
+Hook 不读取 WorkPlan、stage 或 audit 状态。WorkPlan `guard-dispatch` 仍负责
+ready_task（`ready_task_ids`）、stage、audit 和 fresh/reuse 合同，执行后仍保存
+dispatch、execution、Summary 和 Digest。specialized tool path 可能绕过 Hook，
+不能因安装 Hook 删除派发前门禁或执行后审计。
 
 ## 容量与所有权
 

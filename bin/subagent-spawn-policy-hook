@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+SKILL_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+
+exec "$SKILL_DIR/bin/skill-python" "$SKILL_DIR/scripts/subagent_spawn_policy_hook.py" "$@"

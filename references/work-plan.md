@@ -378,7 +378,11 @@ Planner 增加：
 - follow-up 错误携带 fork 策略；
 - 任意非空模型或 reasoning effort 覆盖。
 
-该命令不假设某一种 Codex hook JSON envelope。实际 hook 适配器必须先把工具调用参数写入该 stage 的 dispatch 目录，再传入同一 Bundle 的 `--audit` 引用，以退出码 `0/2` 放行或拒绝。这样即使模型遵守派发合同，若计划或派发证据仍停留在临时目录，门禁也不会放行。
+该命令不假设某一种 Codex Hook JSON envelope。主代理必须先把工具调用参数写入该 stage 的 dispatch 目录，再传入同一 Bundle 的 `--audit` 引用，以退出码 `0/2` 放行或拒绝。这样即使模型遵守派发合同，若计划或派发证据仍停留在临时目录，门禁也不会放行。
+
+用户级 `subagent-spawn-policy-hook` 只做无状态的通用 spawn 参数检查，不调用此命令，
+也不写入 Bundle。`guard-dispatch` 继续负责 ready_task、stage、audit 和 fresh/reuse 合同。
+specialized tool path 可能绕过 Hook，因此执行后审计仍是必需步骤。
 
 ## Execution record version 6
 

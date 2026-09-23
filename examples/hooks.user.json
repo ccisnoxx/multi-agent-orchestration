@@ -1,0 +1,18 @@
+{
+  "description": "固定角色 Profile 的无状态子代理派发门禁。",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ".*spawn_agent$|^Agent$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/multi-agent-orchestration/bin/subagent-spawn-policy-hook",
+            "timeout": 10,
+            "statusMessage": "检查子代理派发策略"
+          }
+        ]
+      }
+    ]
+  }
+}

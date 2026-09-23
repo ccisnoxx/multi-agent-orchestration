@@ -179,6 +179,77 @@ cd /Users/sc/.codex/skills/multi-agent-orchestration
 
 修改 Skill、Agent TOML 或 `config.toml` 后，应启动新的 Codex 会话再验证实际加载行为。文件变化本身不能证明现有会话已经重新加载。
 
+### 5.1 用户级 PreToolUse Hook
+
+`bin/subagent-spawn-policy-hook` 是无状态的通用 spawn 策略门禁。它从 stdin 读取
+Codex PreToolUse JSON，仅检查 `spawn_agent`、`Agent` 和以 `spawn_agent` 结尾的
+namespaced 工具。策略要求：
+
+- `task_name`、`agent_type` 必须为非空字符串（纯空白也拒绝）；
+- `fork_turns` 必须显式等于 `"none"`；
+- `tool_input` 内的 `model`、`reasoning_effort`、`model_reasoning_effort` 只能缺省、
+  为 `null` 或空字符串，其他值均拒绝；顶层 `model` 是 Hook 元数据，不是 spawn 覆盖。
+
+合法调用退出 `0` 且不输出内容。拒绝、非法 JSON、非 object 的事件或 spawn
+`tool_input` 向 stderr 输出明确原因并退出 `2`。其他工具退出 `0`，不检查其参数。
+Hook 不保存状态、不读取 Profile 或 WorkPlan，也不写入审计产物。
+
+在仓库根目录执行以下安装命令。它会先备份已有 `~/.codex/hooks.json`，再从示例生成
+用户级配置，替换为入口的绝对 command 路径；已有其他 Hook 的定义可从备份中恢复或合并。
+
+```bash
+chmod 755 bin/subagent-spawn-policy-hook
+./bin/skill-python - <<'PY'
+import json
+import shlex
+import shutil
+from datetime import datetime, timezone
+from pathlib import Path
+
+root = Path.cwd().resolve()
+target = Path.home() / ".codex" / "hooks.json"
+config = json.loads((root / "examples/hooks.user.json").read_text(encoding="utf-8"))
+command = root / "bin/subagent-spawn-policy-hook"
+config["hooks"]["PreToolUse"][0]["hooks"][0]["command"] = shlex.quote(str(command))
+target.parent.mkdir(parents=True, exist_ok=True)
+if target.exists():
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    backup = target.with_name(f"hooks.json.backup-{stamp}")
+    shutil.copy2(target, backup)
+    backup.chmod(0o600)
+    print(f"已备份：{backup}")
+target.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+target.chmod(0o600)
+print(f"已安装：{target}")
+PY
+```
+
+无需修改现有 `config.toml`。安装后**启动新 Codex 会话，在 `/hooks` 中审查和信任**：
+
+1. 确认至少一个 `PreToolUse` 条目，来源为 `~/.codex/hooks.json`。
+2. 审查 matcher `.*spawn_agent$|^Agent$`、绝对 command 路径与脚本内容。
+3. 由用户信任该 Hook；不自动编辑 trust 存储，也不使用绕过 Hook trust 的启动参数。
+
+未信任的 Hook 会被跳过；定义变更后需要重新审查。文件已安装、直接执行脚本成功，
+都不能证明当前会话已经加载或信任 Hook。加载和信任规则见
+[OpenAI Hooks 文档](https://learn.chatgpt.com/docs/hooks)。
+
+运行 `./bin/verify-skill` 可覆盖 Hook 进程测试。也可直接输入事件检查退出码：
+
+```bash
+printf '%s\n' '{"tool_name":"spawn_agent","tool_input":{"task_name":"review","agent_type":"reviewer","fork_turns":"none"}}' | ./bin/subagent-spawn-policy-hook
+echo "$?"  # 预期 0，无 Hook 输出
+printf '%s\n' '{"tool_name":"spawn_agent","tool_input":{"task_name":"review","agent_type":"reviewer","fork_turns":"all"}}' | ./bin/subagent-spawn-policy-hook
+echo "$?"  # 预期 2，stderr 说明 fork_turns 违规
+printf '%s\n' '{"tool_name":"spawn_agent","tool_input":{"task_name":"review","agent_type":"reviewer","fork_turns":"none","model":"override"}}' | ./bin/subagent-spawn-policy-hook
+echo "$?"  # 预期 2，stderr 说明 model 覆盖违规
+```
+
+WorkPlan `guard-dispatch` 仍负责 ready_task（`ready_task_ids`）、stage、audit 和
+fresh/reuse 合同，必须按第 7 节准备派发证据并运行门禁。specialized tool path 可能
+绕过 Hook，不能删除执行后审计；继续记录实际 dispatch、execution、Summary 和 Digest。
+Hook 放行也不证明角色存在、任务 ready 或当前派发已绑定正确 Audit Stage。
+
 ---
 
 ## 6. Audit Bundle 的目录与生命周期
@@ -1155,3 +1226,4 @@ Bundle 校验通过前不会关闭，可修正文件后再次运行 `audit-final
 ## 18. 推荐落地原则
 
 > **工作代码留在项目仓库；多代理机器审计留在 `$CODEX_HOME/audits/multi-agent`；JSON 是权威机器事实源；用户可见内容使用由 JSON 确定性渲染的 Markdown；普通审计产物不默认提交 GitHub；高风险或异常任务按项目策略延长保留或永久归档。**
+
