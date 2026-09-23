@@ -2,6 +2,8 @@
 
 面向 Codex 固定角色 Profile 的多子代理编排 Skill，以及本地确定性的 WorkPlan、执行审计和持久化 Audit Bundle 生命周期工具。
 
+详细使用、完整工作流、Audit Bundle 管理、产物归档和清理方法见 [`docs/USAGE_AND_AUDIT_GUIDE.md`](docs/USAGE_AND_AUDIT_GUIDE.md)。
+
 ## 1.6.0 重点
 
 - 所有实际子代理任务先创建持久化 Audit Bundle，默认位于 `$CODEX_HOME/audits/multi-agent`；
