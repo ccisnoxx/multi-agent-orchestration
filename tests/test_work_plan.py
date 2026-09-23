@@ -3,10 +3,12 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -255,9 +257,14 @@ max_wait_timeout_ms = 240000
         self.assertEqual(result["codex_config_evidence"]["capacity_source"], "codex_config")
 
     def test_doctor_accepts_fixed_profile_configuration(self) -> None:
-        report = work_plan.build_doctor_report(self.roles, self.config)
+        audit_root = self.root / "audits"
+        audit_root.mkdir()
+        report = work_plan.build_doctor_report(self.roles, self.config, audit_root)
         self.assertEqual(report["status"], "passed")
+        self.assertEqual(report["report_version"], 2)
         self.assertEqual(report["errors"], [])
+        self.assertTrue(report["audit_root"]["exists"])
+        self.assertTrue(report["audit_root"]["writable"])
 
     def test_fresh_task_requires_isolated_fork(self) -> None:
         row = task("scan-a1", "analyst", read_paths=["src"])
@@ -422,6 +429,56 @@ max_wait_timeout_ms = 240000
         self.assertEqual(result["status"], "passed")
         self.assertEqual(result["observed_dispatch"]["fork_turns"], "none")
 
+    def test_guard_audit_membership_requires_same_open_stage(self) -> None:
+        row = task("scan-a1", "analyst", read_paths=["src"])
+        plan = self.plan(draft([row]))
+        audit_root = self.root / "audits"
+        bundle, _ = work_plan.create_audit_bundle(
+            audit_root, ROOT, "guard membership"
+        )
+        stage = work_plan.allocate_audit_stage(bundle, "analysis")
+        plan_path = Path(stage["paths"]["plan"])
+        dispatch_path = (
+            Path(stage["paths"]["dispatch_dir"]) / "scan-a1.json"
+        )
+        plan_path.write_text(
+            json.dumps(plan, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        dispatch_path.write_text(
+            json.dumps(
+                {
+                    "method": "spawn_agent",
+                    "task_name": "scan-a1",
+                    "agent_type": "analyst",
+                    "fork_turns": "none",
+                    "model": None,
+                    "reasoning_effort": None,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        membership = work_plan.guard_audit_membership(
+            bundle, plan_path, dispatch_path
+        )
+        self.assertEqual(membership["audit_id"], bundle.name)
+        self.assertEqual(membership["audit_stage"], "01-analysis")
+
+        outside = self.root / "outside-dispatch.json"
+        shutil.copy2(dispatch_path, outside)
+        with self.assertRaisesRegex(work_plan.PlanError, "inside the persistent"):
+            work_plan.guard_audit_membership(bundle, plan_path, outside)
+
+        other_stage = work_plan.allocate_audit_stage(bundle, "other")
+        other_dispatch = Path(other_stage["paths"]["dispatch_dir"]) / "scan-a1.json"
+        shutil.copy2(dispatch_path, other_dispatch)
+        with self.assertRaisesRegex(work_plan.PlanError, "same audit stage"):
+            work_plan.guard_audit_membership(bundle, plan_path, other_dispatch)
+
     def test_guard_dispatch_rejects_full_history_and_overrides(self) -> None:
         row = task("scan-a1", "analyst", read_paths=["src"])
         plan = self.plan(draft([row]))
@@ -571,6 +628,66 @@ max_wait_timeout_ms = 240000
         self.assertEqual(stats["wait_call_count"], 3)
         self.assertEqual(stats["wait_timeout_count"], 2)
 
+    def test_digest_markdown_table_contract_is_exact(self) -> None:
+        row = task("scan-a1", "analyst", read_paths=["src"])
+        plan = self.plan(draft([row], plan_id="markdown-contract-plan"))
+        worker = execution_worker(plan["tasks"][0], "worker-scan", observed_write_paths=[])
+        execution = execution_record(plan, [worker])
+        digest = work_plan.build_execution_digest([(plan, execution)], self.roles, self.config)
+
+        rendered = work_plan.render_execution_digest(digest)
+        lines = rendered.splitlines()
+
+        self.assertEqual(
+            lines[:4],
+            [
+                "### 子任务执行概览",
+                "",
+                "| `agent_type` | 模型（Agent TOML） | 推理档位 | 执行尝试 | 验收通过 | 独立复核 |",
+                "|---|---|---|---:|---:|---:|",
+            ],
+        )
+        self.assertIn(
+            "| `analyst` | `gpt-5.6-sol` | `high` | 1 | 1 | 0 |",
+            lines,
+        )
+        self.assertNotIn("Agent 类型Agent TOML 配置执行尝试验收通过独立复核", rendered)
+
+    def test_render_digest_snapshot_survives_live_config_drift(self) -> None:
+        row = task("scan-a1", "analyst", read_paths=["src"])
+        plan = self.plan(draft([row], plan_id="render-snapshot-plan"))
+        worker = execution_worker(plan["tasks"][0], "worker-scan", observed_write_paths=[])
+        execution = execution_record(plan, [worker])
+        digest = work_plan.build_execution_digest([(plan, execution)], self.roles, self.config)
+
+        self.config_path.write_text(
+            self.config_path.read_text(encoding="utf-8") + "# later config edit\n",
+            encoding="utf-8",
+        )
+        drifted_config = work_plan.load_codex_config(self.config_path, required=True)
+        with self.assertRaisesRegex(
+            work_plan.PlanError,
+            "codex_config_evidence",
+        ):
+            work_plan.build_execution_digest([(plan, execution)], self.roles, drifted_config)
+
+        snapshot = work_plan.validate_digest_snapshot_for_render(digest)
+        rendered = work_plan.render_execution_digest(snapshot)
+        self.assertIn(
+            "| `analyst` | `gpt-5.6-sol` | `high` | 1 | 1 | 0 |",
+            rendered,
+        )
+
+    def test_render_digest_snapshot_rejects_wrong_version(self) -> None:
+        row = task("scan-a1", "analyst", read_paths=["src"])
+        plan = self.plan(draft([row], plan_id="render-version-plan"))
+        worker = execution_worker(plan["tasks"][0], "worker-scan", observed_write_paths=[])
+        execution = execution_record(plan, [worker])
+        digest = work_plan.build_execution_digest([(plan, execution)], self.roles, self.config)
+        digest["digest_version"] = 999
+        with self.assertRaisesRegex(work_plan.PlanError, "digest_version"):
+            work_plan.validate_digest_snapshot_for_render(digest)
+
     def test_digest_uses_latest_active_snapshot(self) -> None:
         row1 = task("scan-a1", "analyst", read_paths=["src/a"])
         plan1 = self.plan(draft([row1], plan_id="active-first"))
@@ -613,6 +730,327 @@ max_wait_timeout_ms = 240000
         }
         self.assertEqual(before, after)
 
+
+    def _populate_complete_audit_bundle(self, *, risk: str = "normal") -> Path:
+        audit_root = self.root / "audits"
+        bundle, _ = work_plan.create_audit_bundle(
+            audit_root,
+            ROOT,
+            "示例审计任务",
+            risk=risk,
+            retention_days=1,
+            now=datetime(2026, 9, 22, tzinfo=timezone.utc),
+        )
+        stage_a = work_plan.allocate_audit_stage(bundle, "analysis")
+        stage_b = work_plan.allocate_audit_stage(bundle, "retry")
+
+        def copy(source: Path, destination: str) -> None:
+            target = Path(destination)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+
+        copy(ROOT / "examples" / "work-plan.draft.json", stage_a["paths"]["draft"])
+        copy(ROOT / "examples" / "work-plan.generated.json", stage_a["paths"]["plan"])
+        copy(ROOT / "examples" / "work-plan.execution.json", stage_a["paths"]["execution"])
+        copy(
+            ROOT / "examples" / "work-plan.execution-summary.json",
+            stage_a["paths"]["summary_json"],
+        )
+        copy(
+            ROOT / "examples" / "work-plan.dispatch.json",
+            str(Path(stage_a["paths"]["dispatch_dir"]) / "auth-cause-a1.json"),
+        )
+
+        copy(
+            ROOT / "examples" / "role-mismatch-retry.draft.json",
+            stage_b["paths"]["draft"],
+        )
+        copy(
+            ROOT / "examples" / "role-mismatch-retry.generated.json",
+            stage_b["paths"]["plan"],
+        )
+        copy(
+            ROOT / "examples" / "role-mismatch-retry.execution.json",
+            stage_b["paths"]["execution"],
+        )
+        copy(
+            ROOT / "examples" / "role-mismatch-retry.execution-summary.json",
+            stage_b["paths"]["summary_json"],
+        )
+        dispatch_b = {
+            "method": "spawn_agent",
+            "task_name": "分析价格计算链",
+            "agent_type": "analyst",
+            "fork_turns": "none",
+            "model": None,
+            "reasoning_effort": None,
+        }
+        dispatch_b_path = Path(stage_b["paths"]["dispatch_dir"]) / "pricing-explain-a2.json"
+        dispatch_b_path.write_text(
+            json.dumps(dispatch_b, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        copy(
+            ROOT / "examples" / "subagent-execution-digest.json",
+            str(bundle / "SUBAGENT_EXECUTION_DIGEST.json"),
+        )
+        return bundle
+
+    def test_audit_bundle_lifecycle_is_discoverable_and_verifiable(self) -> None:
+        audit_root = self.root / "audits"
+        bundle = self._populate_complete_audit_bundle()
+
+        report = work_plan.finalize_audit_bundle(bundle)
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(report["bundle_status"], "closed")
+        self.assertTrue((bundle / "SUBAGENT_EXECUTION_DIGEST.md").is_file())
+        self.assertTrue((bundle / "01-analysis.summary.txt").is_file())
+        self.assertTrue((bundle / "02-retry.summary.txt").is_file())
+
+        verify = work_plan.inspect_audit_bundle(bundle, compare_manifest=True)
+        self.assertEqual(verify["status"], "passed")
+        manifest = work_plan.show_audit_bundle(bundle)
+        self.assertEqual(manifest["status"], "closed")
+        self.assertEqual(manifest["bundle_version"], 1)
+        self.assertEqual(manifest["summary"]["plan_count"], 2)
+        self.assertEqual(len(manifest["artifacts"]), 14)
+
+        listed = work_plan.list_audit_bundles(audit_root)
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0]["audit_id"], manifest["audit_id"])
+        self.assertEqual(
+            work_plan.resolve_audit_bundle(manifest["audit_id"], audit_root),
+            bundle,
+        )
+
+
+    def test_audit_import_migrates_existing_temporary_directory(self) -> None:
+        source = self._populate_complete_audit_bundle()
+        import_root = self.root / "imported-audits"
+        bundle, report = work_plan.import_audit_directory(
+            import_root,
+            source,
+            ROOT,
+            "imported smoke test",
+            retention_days=7,
+        )
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(work_plan._read_audit_manifest(bundle)["status"], "closed")
+        self.assertTrue((bundle / "SUBAGENT_EXECUTION_DIGEST.md").is_file())
+        self.assertEqual(len(work_plan.list_audit_bundles(import_root)), 1)
+        self.assertIn("audit bundle has no allocated stages", report["warnings"])
+
+    def test_audit_verify_detects_artifact_tampering(self) -> None:
+        bundle = self._populate_complete_audit_bundle()
+        self.assertEqual(work_plan.finalize_audit_bundle(bundle)["status"], "passed")
+        execution = bundle / "01-analysis.execution.json"
+        execution.write_text(execution.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        report = work_plan.inspect_audit_bundle(bundle, compare_manifest=True)
+        self.assertEqual(report["status"], "failed")
+        self.assertTrue(
+            any("checksum mismatch" in item for item in report["errors"]),
+            report["errors"],
+        )
+
+    def test_audit_delete_requires_confirmation_and_protects_attention(self) -> None:
+        audit_root = self.root / "audits"
+        bundle = self._populate_complete_audit_bundle()
+        self.assertEqual(work_plan.finalize_audit_bundle(bundle)["status"], "passed")
+        with self.assertRaisesRegex(work_plan.PlanError, "requires --yes"):
+            work_plan.delete_audit_bundle(bundle, confirmed=False, force=False)
+
+        manifest_path = bundle / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["summary"]["attention_required"] = True
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(work_plan.PlanError, "with anomalies"):
+            work_plan.delete_audit_bundle(bundle, confirmed=True, force=False)
+        result = work_plan.delete_audit_bundle(bundle, confirmed=True, force=True)
+        self.assertEqual(result["status"], "deleted")
+        self.assertFalse(bundle.exists())
+        self.assertEqual(work_plan.list_audit_bundles(audit_root), [])
+
+
+    def test_invalid_manifest_remains_listable_and_force_deletable(self) -> None:
+        audit_root = self.root / "audits"
+        bundle, _ = work_plan.create_audit_bundle(audit_root, ROOT, "invalid manifest")
+        (bundle / "manifest.json").write_text("{broken", encoding="utf-8")
+        rows = work_plan.list_audit_bundles(audit_root)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "invalid")
+        resolved = work_plan.resolve_audit_bundle(
+            bundle.name,
+            audit_root,
+            allow_invalid=True,
+        )
+        result = work_plan.delete_audit_bundle(
+            resolved,
+            confirmed=True,
+            force=True,
+        )
+        self.assertEqual(result["status"], "deleted")
+        self.assertFalse(bundle.exists())
+
+    def test_audit_prune_is_dry_run_by_default(self) -> None:
+        audit_root = self.root / "audits"
+        bundle = self._populate_complete_audit_bundle()
+        self.assertEqual(work_plan.finalize_audit_bundle(bundle)["status"], "passed")
+        manifest_path = bundle / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["retention"]["delete_after"] = "2026-09-20T00:00:00Z"
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        current = datetime(2026, 9, 22, tzinfo=timezone.utc)
+        dry_run = work_plan.prune_audit_bundles(
+            audit_root,
+            apply=False,
+            include_attention=False,
+            now=current,
+        )
+        self.assertEqual(dry_run["selected_count"], 1)
+        self.assertTrue(bundle.exists())
+        applied = work_plan.prune_audit_bundles(
+            audit_root,
+            apply=True,
+            include_attention=False,
+            now=current,
+        )
+        self.assertEqual(applied["selected_count"], 1)
+        self.assertFalse(bundle.exists())
+
+    def test_audit_finalize_rejects_incomplete_bundle(self) -> None:
+        bundle, _ = work_plan.create_audit_bundle(
+            self.root / "audits",
+            ROOT,
+            "incomplete",
+        )
+        work_plan.allocate_audit_stage(bundle, "implementation")
+        report = work_plan.finalize_audit_bundle(bundle)
+        self.assertEqual(report["status"], "failed")
+        self.assertTrue(report["errors"])
+        manifest = work_plan._read_audit_manifest(bundle)
+        self.assertEqual(manifest["status"], "open")
+        self.assertEqual(manifest["verification"]["status"], "failed")
+
+
+    def test_cli_audit_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            audit_root = root / "audits"
+            base = [
+                sys.executable,
+                str(SCRIPT),
+                "--audit-root",
+                str(audit_root),
+            ]
+            init_result = subprocess.run(
+                base
+                + [
+                    "audit-init",
+                    "--task-name",
+                    "CLI audit lifecycle",
+                    "--repo-root",
+                    str(ROOT),
+                    "--retention-days",
+                    "1",
+                    "--json",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            descriptor = json.loads(init_result.stdout)
+            bundle = Path(descriptor["audit_dir"])
+
+            def stage(name: str) -> dict:
+                result = subprocess.run(
+                    base + ["audit-stage", str(bundle), "--name", name],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return json.loads(result.stdout)
+
+            stage_a = stage("analysis")
+            stage_b = stage("retry")
+
+            def copy(source: Path, destination: str) -> None:
+                target = Path(destination)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+
+            copy(ROOT / "examples" / "work-plan.draft.json", stage_a["paths"]["draft"])
+            copy(ROOT / "examples" / "work-plan.generated.json", stage_a["paths"]["plan"])
+            copy(ROOT / "examples" / "work-plan.execution.json", stage_a["paths"]["execution"])
+            copy(
+                ROOT / "examples" / "work-plan.execution-summary.json",
+                stage_a["paths"]["summary_json"],
+            )
+            copy(
+                ROOT / "examples" / "work-plan.dispatch.json",
+                str(Path(stage_a["paths"]["dispatch_dir"]) / "auth-cause-a1.json"),
+            )
+            copy(
+                ROOT / "examples" / "role-mismatch-retry.draft.json",
+                stage_b["paths"]["draft"],
+            )
+            copy(
+                ROOT / "examples" / "role-mismatch-retry.generated.json",
+                stage_b["paths"]["plan"],
+            )
+            copy(
+                ROOT / "examples" / "role-mismatch-retry.execution.json",
+                stage_b["paths"]["execution"],
+            )
+            copy(
+                ROOT / "examples" / "role-mismatch-retry.execution-summary.json",
+                stage_b["paths"]["summary_json"],
+            )
+            dispatch_b = {
+                "method": "spawn_agent",
+                "task_name": "分析价格计算链",
+                "agent_type": "analyst",
+                "fork_turns": "none",
+                "model": None,
+                "reasoning_effort": None,
+            }
+            dispatch_b_path = Path(stage_b["paths"]["dispatch_dir"]) / "pricing-explain-a2.json"
+            dispatch_b_path.write_text(
+                json.dumps(dispatch_b, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            copy(
+                ROOT / "examples" / "subagent-execution-digest.json",
+                str(bundle / "SUBAGENT_EXECUTION_DIGEST.json"),
+            )
+
+            subprocess.run(base + ["audit-finalize", str(bundle)], check=True)
+            subprocess.run(base + ["audit-verify", descriptor["audit_id"]], check=True)
+            listed = subprocess.run(
+                base + ["audit-list", "--json"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(json.loads(listed.stdout)["count"], 1)
+            shown = subprocess.run(
+                base + ["audit-show", descriptor["audit_id"], "--json"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(json.loads(shown.stdout)["status"], "closed")
+            subprocess.run(
+                base + ["audit-delete", descriptor["audit_id"], "--yes"],
+                check=True,
+            )
+            self.assertFalse(bundle.exists())
+
     def test_cli_plan_validate_summary_digest_and_doctor(self) -> None:
         command = [
             sys.executable,
@@ -623,6 +1061,8 @@ max_wait_timeout_ms = 240000
             str(ROOT / "examples" / "config.toml"),
         ]
         with tempfile.TemporaryDirectory() as directory:
+            audit_root = Path(directory) / "audits"
+            command = command[:2] + ["--audit-root", str(audit_root)] + command[2:]
             output = Path(directory) / "plan.json"
             subprocess.run(
                 command
@@ -646,6 +1086,7 @@ max_wait_timeout_ms = 240000
                 check=True,
                 stdout=subprocess.DEVNULL,
             )
+            digest_path = Path(directory) / "digest.json"
             subprocess.run(
                 command
                 + [
@@ -654,11 +1095,40 @@ max_wait_timeout_ms = 240000
                     str(output),
                     str(ROOT / "examples" / "work-plan.execution.json"),
                     "--json",
+                    "--output",
+                    str(digest_path),
                 ],
                 check=True,
-                stdout=subprocess.DEVNULL,
             )
-            dispatch_path = Path(directory) / "dispatch.json"
+            rendered_path = Path(directory) / "digest.md"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--agents-dir",
+                    str(Path(directory) / "missing-agents"),
+                    "--codex-config",
+                    str(Path(directory) / "missing-config.toml"),
+                    "render-digest",
+                    str(digest_path),
+                    "--output",
+                    str(rendered_path),
+                ],
+                check=True,
+            )
+            self.assertIn(
+                "| `analyst` | `gpt-5.6-sol` | `high` | 1 | 1 | 0 |",
+                rendered_path.read_text(encoding="utf-8"),
+            )
+            bundle, _ = work_plan.create_audit_bundle(
+                audit_root, ROOT, "CLI guard"
+            )
+            stage = work_plan.allocate_audit_stage(bundle, "analysis")
+            guarded_plan = Path(stage["paths"]["plan"])
+            shutil.copy2(output, guarded_plan)
+            dispatch_path = (
+                Path(stage["paths"]["dispatch_dir"]) / "auth-cause-a1.json"
+            )
             dispatch_path.write_text(
                 json.dumps(
                     {
@@ -673,17 +1143,21 @@ max_wait_timeout_ms = 240000
                 ),
                 encoding="utf-8",
             )
-            subprocess.run(
+            guarded = subprocess.run(
                 command
                 + [
                     "guard-dispatch",
-                    str(output),
+                    str(guarded_plan),
                     "auth-cause-a1",
                     str(dispatch_path),
+                    "--audit",
+                    bundle.name,
                 ],
                 check=True,
-                stdout=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
             )
+            self.assertEqual(json.loads(guarded.stdout)["audit_id"], bundle.name)
             subprocess.run(command + ["doctor", "--json"], check=True, stdout=subprocess.DEVNULL)
 
 

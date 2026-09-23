@@ -1,6 +1,6 @@
 ---
 name: multi-agent-orchestration
-description: 为适合独立并行、上下文隔离或独立复核的 Codex 任务选择固定 Profile 子代理，建立完整任务合同、文件所有权、依赖、生命周期、低通信等待和可审计执行记录。用于用户明确要求委派，或项目规则已授权且委派具有实际收益时；小型、紧耦合、立即阻塞或本地完成更便宜的工作由主代理直接完成。
+description: 为适合独立并行、上下文隔离或独立复核的 Codex 任务选择固定 Profile 子代理，建立完整任务合同、文件所有权、依赖、生命周期、低通信等待和持久化可管理的审计 Bundle。用于用户明确要求委派，或项目规则已授权且委派具有实际收益时；小型、紧耦合、立即阻塞或本地完成更便宜的工作由主代理直接完成。
 ---
 
 # 子代理编排
@@ -17,6 +17,7 @@ description: 为适合独立并行、上下文隔离或独立复核的 Codex 任
   → WorkPlan：依赖、容量、冲突、波次、身份和派发合同
   → Agent TOML：固定 model、reasoning effort、sandbox 和角色行为
   → 主代理：实际派发、低通信等待、验收、整合与独立复核
+  → Audit Bundle：持久化 plan、dispatch、execution、summary、digest 和版本清单
   → Summary / Digest：机器审计与用户可见概览
 ```
 
@@ -120,38 +121,107 @@ Planner 不创建 Worker、不调用模型、不联网、不修改目标仓库�
 
 派发内容按任务需要包含：目标、输入、工作目录、所有权、并行边界、必须保持的合同、验收条件、验证要求、排除范围和通信规则。
 
+## 持久化 Audit Bundle
+
+凡实际创建或复用一个或多个 Worker，必须在首次派发前创建持久化 Audit Bundle。不得把正式审计产物只留在 `/tmp`、会话临时目录或难以发现的任意路径。
+
+默认根目录：
+
+```text
+${MULTI_AGENT_AUDIT_ROOT:-${CODEX_HOME:-$HOME/.codex}/audits/multi-agent}
+```
+
+创建 Bundle：
+
+```bash
+AUDIT_DIR=$(./bin/work-plan audit-init \
+  --repo-root "$PWD" \
+  --task-name "当前用户任务的简短名称")
+```
+
+高风险任务使用 `--risk high`；需要永久保留时使用 `--keep`；普通任务默认保留 14 天，高风险任务默认 90 天。
+
+每个 WorkPlan 阶段先分配稳定文件路径：
+
+```bash
+./bin/work-plan audit-stage "$AUDIT_DIR" \
+  --name implementation \
+  --output /tmp/audit-stage.json
+```
+
+只能把该阶段的 draft、generated plan、每个实际 dispatch、execution、summary 写入 `audit-stage` 返回的路径。dispatch 一项一个 JSON，写入返回的 `dispatch_dir`。会话级 Digest 固定写入：
+
+```text
+$AUDIT_DIR/SUBAGENT_EXECUTION_DIGEST.json
+$AUDIT_DIR/SUBAGENT_EXECUTION_DIGEST.md
+```
+
+全部阶段完成后执行：
+
+```bash
+./bin/work-plan audit-finalize "$AUDIT_DIR"
+./bin/work-plan audit-verify "$AUDIT_DIR"
+```
+
+`audit-finalize` 自动生成或规范化 Markdown Digest 和文本 Summary，记录 Bundle version、Skill release、Planner/schema 版本、artifact 路径、SHA-256、大小、retention、异常状态并关闭 Bundle。关闭后默认视为不可变；修改任何 artifact 都会使 `audit-verify` 失败。
+
+已有临时审计目录可迁移：
+
+```bash
+./bin/work-plan audit-import /tmp/existing-audit \
+  --repo-root "$PWD" \
+  --task-name "原任务名称"
+```
+
+查找、审计和删除：
+
+```bash
+./bin/work-plan audit-list
+./bin/work-plan audit-show AUDIT_ID
+./bin/work-plan audit-verify AUDIT_ID
+./bin/work-plan audit-delete AUDIT_ID --yes
+./bin/work-plan audit-prune
+./bin/work-plan audit-prune --apply
+```
+
+`audit-prune` 默认 dry-run，只删除 retention 已到期、已关闭、校验通过且无异常的 Bundle。有异常、open 或未验证 Bundle 默认受保护；显式删除它们必须使用 `audit-delete AUDIT_ID --yes --force`。
+
+最终回复在子任务执行概览后提供简短 `audit_id`，不默认暴露本机绝对路径。需要定位时通过 `audit-list` 或 `audit-show` 查找。
+
 ## WorkPlan
 
-以下任一情况必须先生成并校验 WorkPlan：
+凡实际创建或复用 Worker，都必须生成并校验 WorkPlan，包括单一、无依赖的 Worker。单任务计划的本地成本很低，但能确保派发合同、配置快照、所有权、执行证据和持久化 Bundle 完整闭合。
+
+以下情况尤其必须在派发前重新规划：
 
 - 同一阶段准备创建两个或更多 Worker；
-- 存在两个或更多写入任务；
+- 存在一个或多个写入任务；
 - 任务之间存在依赖；
 - 需要根据当前活跃 Worker 计算容量；
 - 需要 retry、复用 Completed Worker 或执行独立复核；
-- 新任务可能与活跃 Worker 发生读写冲突。
-
-单一、无依赖、无复用、无 retry、无并行冲突的 Worker 可以直接按固定派发合同执行，但仍必须遵守隔离上下文和低通信策略。
+- 新任务可能与活跃 Worker 发生读写冲突；
+- 状态、配置、依赖、所有权或验收结果已经变化。
 
 ```bash
 ./bin/work-plan \
   --agents-dir "${CODEX_AGENTS_DIR:-$HOME/.codex/agents}" \
   --codex-config "${CODEX_CONFIG:-$HOME/.codex/config.toml}" \
-  plan /path/to/work-plan.draft.json \
-  --output /tmp/work-plan.json
+  plan "$STAGE_DRAFT" \
+  --output "$STAGE_PLAN"
 
 ./bin/work-plan \
   --agents-dir "${CODEX_AGENTS_DIR:-$HOME/.codex/agents}" \
   --codex-config "${CODEX_CONFIG:-$HOME/.codex/config.toml}" \
-  validate /tmp/work-plan.json
+  validate "$STAGE_PLAN"
 
 ./bin/work-plan \
   --agents-dir "${CODEX_AGENTS_DIR:-$HOME/.codex/agents}" \
   --codex-config "${CODEX_CONFIG:-$HOME/.codex/config.toml}" \
-  guard-dispatch /tmp/work-plan.json TASK_ID /tmp/normalized-dispatch.json
+  guard-dispatch "$STAGE_PLAN" TASK_ID "$STAGE_DISPATCH" \
+  --audit "$AUDIT_ID"
 ```
 
-`guard-dispatch` 是与 hook 传输格式解耦的派发前门禁。hook 只需把实际工具参数整理为标准 JSON；门禁会拒绝非 ready task、错误角色、`fork_turns: "all"` 和模型/effort 覆盖。
+`guard-dispatch` 是与 hook 传输格式解耦的派发前门禁。hook 必须先把实际工具参数写入当前 Bundle 对应 stage 的 dispatch 目录，再传入 `--audit`。门禁除了拒绝非 ready task、错误角色、`fork_turns: "all"` 和模型/effort 覆盖，还会拒绝不在持久化 Bundle 中、或 plan 与 dispatch 不属于同一 stage 的调用。不得仅在 `/tmp` 中准备派发证据后绕过此门禁。
 
 WorkPlan schema、字段、执行记录和示例见 `references/work-plan.md`。
 
@@ -229,21 +299,41 @@ WorkPlan schema、字段、执行记录和示例见 `references/work-plan.md`。
 
 ## 执行审计与最终回复
 
-凡使用 WorkPlan 并实际派发 Worker，必须保存 execution record 并生成完整 Summary。完成当前用户任务前，将本任务全部计划按执行顺序聚合为 Digest：
+每个实际派发阶段必须把 dispatch、execution record 和完整 Summary 写入其 Audit Stage 路径。完成当前用户任务前，将 Bundle 内全部计划按执行顺序聚合为 Digest，并关闭、验证 Bundle：
 
 ```bash
-./bin/work-plan summary PLAN.json EXECUTION.json --json --output SUMMARY.json
+./bin/work-plan summary \
+  "$STAGE_PLAN" "$STAGE_EXECUTION" \
+  --json --output "$STAGE_SUMMARY_JSON"
 
 ./bin/work-plan digest \
-  --entry PLAN-A.json EXECUTION-A.json \
-  --entry PLAN-B.json EXECUTION-B.json \
+  --entry "$STAGE_A_PLAN" "$STAGE_A_EXECUTION" \
+  --entry "$STAGE_B_PLAN" "$STAGE_B_EXECUTION" \
   --json \
-  --output SUBAGENT_EXECUTION_DIGEST.json
+  --output "$AUDIT_DIR/SUBAGENT_EXECUTION_DIGEST.json"
+
+./bin/work-plan render-digest \
+  "$AUDIT_DIR/SUBAGENT_EXECUTION_DIGEST.json" \
+  --output "$AUDIT_DIR/SUBAGENT_EXECUTION_DIGEST.md"
+
+./bin/work-plan audit-finalize "$AUDIT_DIR"
+./bin/work-plan audit-verify "$AUDIT_DIR"
 ```
+
+`digest` 负责重新验证 plan、execution、Agent TOML 和当前 `config.toml`。JSON Digest 一旦成功生成，即为该次执行的历史审计快照。后续仅为补生成、恢复或重新展示 Markdown 时，必须使用 `render-digest`，不得重新运行 `digest` 使当前配置漂移阻断纯展示，也不得修改旧计划中的配置证据来迎合当前配置。
 
 Execution record 必须记录实际派发方式、`fork_turns`、模型覆盖为空、实际写入路径证据、follow-up、中途消息、等待和状态轮询次数。
 
-最终用户回复正常只展示紧凑的 `SUBAGENT_EXECUTION_DIGEST` 聚合结果。只有用户明确要求原始审计，或存在未验收通过、尚未验收、未执行 ready task、残留活跃 Worker、未知写入证据或配置冲突时，才展开对应细节。
+最终用户回复正常只展示紧凑的 `SUBAGENT_EXECUTION_DIGEST` 聚合结果。用户可见的“子任务执行概览”必须直接复用本地 renderer 生成的 `SUBAGENT_EXECUTION_DIGEST.md`，不得根据 JSON 手工重建表格、合并表头、改变列顺序、改写统计值或在管道符前添加转义字符。可以在该区块前后补充任务结果和限制，但下列表头与分隔行必须原样保留：
+
+```markdown
+| `agent_type` | 模型（Agent TOML） | 推理档位 | 执行尝试 | 验收通过 | 独立复核 |
+|---|---|---|---:|---:|---:|
+```
+
+提交最终回复前，读取实际生成的 Markdown 文件并确认表头、分隔行和数据行均为六列；若 Markdown Digest 尚未生成，先对已保存的 JSON Digest 运行 `render-digest`，不得重新聚合历史 plan/execution，也不得临时手工拼表。
+
+只有用户明确要求原始审计，或存在未验收通过、尚未验收、未执行 ready task、残留活跃 Worker、未知写入证据或配置冲突时，才展开对应细节。最终回复同时提供 Bundle 的 `audit_id`，使用户能够用 `audit-show`、`audit-verify` 或 `audit-delete` 定位和管理产物。
 
 ## 配置检查
 

@@ -11,17 +11,24 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
-from collections import defaultdict
+import uuid
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, TypedDict
 
+SKILL_RELEASE = "1.6.0"
 PLANNER_VERSION = "1.5.1"
 SCHEMA_VERSION = 5
 EXECUTION_RECORD_VERSION = 6
 SUMMARY_VERSION = 3
 DIGEST_VERSION = 3
-DOCTOR_VERSION = 1
+DOCTOR_VERSION = 2
+AUDIT_BUNDLE_VERSION = 1
+DEFAULT_AUDIT_RETENTION_DAYS = 14
+HIGH_RISK_AUDIT_RETENTION_DAYS = 90
 
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{5,127}$")
 WORKER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$")
@@ -186,6 +193,39 @@ OBSERVED_DISPATCH_FIELDS = {
     "reasoning_effort_override",
 }
 COMMUNICATION_FIELDS = {"wait_call_count", "wait_timeout_count", "status_poll_count"}
+DIGEST_RENDER_COUNT_FIELDS = {
+    "plan_count",
+    "validated_plan_count",
+    "executed_attempt_count",
+    "accepted_attempt_count",
+    "independent_review_count",
+}
+DIGEST_RENDER_PROFILE_FIELDS = {
+    "agent_type",
+    "configured_model",
+    "configured_model_reasoning_effort",
+    "executed_attempt_count",
+    "accepted_attempt_count",
+    "independent_review_count",
+}
+DIGEST_RENDER_DISPATCH_FIELDS = {
+    "fresh_spawn_count",
+    "reused_followup_count",
+    "isolated_fork_count",
+    "parent_followup_count",
+    "worker_intermediate_message_count",
+    "wait_call_count",
+    "wait_timeout_count",
+    "status_poll_count",
+}
+DIGEST_RENDER_WRITE_FIELDS = {"observed_true", "observed_false", "unknown"}
+DIGEST_RENDER_ANOMALY_TYPES = {
+    "non_accepted_attempts",
+    "unevaluated_attempts",
+    "not_executed_ready_tasks",
+    "active_workers_after_execution",
+    "unknown_write_evidence",
+}
 
 
 class RoleProfile(TypedDict):
@@ -230,6 +270,13 @@ def _toml_parser() -> Any:
 
 def _sha256_bytes(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    try:
+        return _sha256_bytes(path.read_bytes())
+    except OSError as exc:
+        raise PlanError(f"cannot hash file {path}: {exc}") from exc
 
 
 def _load_toml(path: Path) -> tuple[dict[str, Any], bytes]:
@@ -1406,6 +1453,83 @@ def parse_execution_record(
     }
 
 
+def guard_audit_membership(
+    bundle: Path,
+    plan_path: Path,
+    dispatch_path: Path,
+) -> dict[str, Any]:
+    """Require the guarded dispatch to use files allocated by one open audit stage.
+
+    The hook adapter writes the normalized dispatch payload into the stage's
+    persistent dispatch directory before invoking ``guard-dispatch``. This
+    closes the gap where a compliant tool call could execute while its plan or
+    dispatch evidence existed only in a transient location.
+    """
+    bundle = bundle.expanduser().resolve()
+    manifest = _read_audit_manifest(bundle)
+    if manifest.get("status") != "open":
+        raise PlanError("guard audit bundle must be open before dispatch")
+
+    raw_plan = plan_path.expanduser()
+    raw_dispatch = dispatch_path.expanduser()
+    for value, label in ((raw_plan, "plan"), (raw_dispatch, "dispatch")):
+        if value.is_symlink():
+            raise PlanError(f"guard audit {label} must not be a symlink")
+        if not value.is_file():
+            raise PlanError(f"guard audit {label} file does not exist: {value}")
+
+    resolved_plan = raw_plan.resolve()
+    resolved_dispatch = raw_dispatch.resolve()
+    if not resolved_plan.is_relative_to(bundle):
+        raise PlanError("guard audit plan must be inside the persistent audit bundle")
+    if not resolved_dispatch.is_relative_to(bundle):
+        raise PlanError("guard audit dispatch must be inside the persistent audit bundle")
+
+    stages = manifest.get("stages")
+    if not isinstance(stages, list):
+        raise PlanError("guard audit manifest stages must be a list")
+    matches: list[dict[str, Any]] = []
+    for stage in stages:
+        if not isinstance(stage, dict):
+            continue
+        paths = stage.get("paths")
+        if not isinstance(paths, dict):
+            continue
+        planned_path = paths.get("plan")
+        dispatch_dir = paths.get("dispatch_dir")
+        if not isinstance(planned_path, str) or not isinstance(dispatch_dir, str):
+            continue
+        stage_plan = (bundle / planned_path).resolve()
+        stage_dispatch_dir = (bundle / dispatch_dir).resolve()
+        if (
+            resolved_plan == stage_plan
+            and resolved_dispatch.is_relative_to(stage_dispatch_dir)
+            and resolved_dispatch.parent == stage_dispatch_dir
+        ):
+            matches.append(stage)
+
+    if not matches:
+        raise PlanError(
+            "guard audit plan and dispatch are not allocated to the same audit stage"
+        )
+    if len(matches) > 1:
+        raise PlanError("guard audit membership is ambiguous across multiple stages")
+    stage = matches[0]
+    plan_value = _read_json(resolved_plan)
+    plan_id = plan_value.get("plan_id")
+    stage_plan_id = stage.get("plan_id")
+    if stage_plan_id not in (None, plan_id):
+        raise PlanError("guard audit stage plan_id does not match the generated plan")
+
+    return {
+        "audit_id": manifest.get("audit_id"),
+        "audit_bundle_version": manifest.get("bundle_version"),
+        "audit_stage": stage.get("prefix"),
+        "audit_plan": resolved_plan.relative_to(bundle).as_posix(),
+        "audit_dispatch": resolved_dispatch.relative_to(bundle).as_posix(),
+    }
+
+
 def guard_dispatch(
     plan_payload: dict[str, Any],
     task_id: str,
@@ -1734,7 +1858,1269 @@ def build_execution_digest(
     }
 
 
-def build_doctor_report(roles: RoleRegistry, codex_config: dict[str, Any]) -> dict[str, Any]:
+def validate_digest_snapshot_for_render(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate an already-built Digest before pure Markdown rendering.
+
+    Rendering an archived Digest must not re-read current Agent TOMLs or
+    ``config.toml``. Those live files may legitimately drift after the Digest
+    was produced, while the validated JSON snapshot remains the authoritative
+    historical audit artifact.
+    """
+    root = _require_object(payload, "digest")
+    if root.get("digest_type") != "SUBAGENT_EXECUTION_DIGEST":
+        raise PlanError(
+            "digest.digest_type must equal SUBAGENT_EXECUTION_DIGEST"
+        )
+    if root.get("digest_version") != DIGEST_VERSION:
+        raise PlanError(f"digest.digest_version must equal {DIGEST_VERSION}")
+
+    for key in sorted(DIGEST_RENDER_COUNT_FIELDS):
+        _require_nonnegative_int(root.get(key), f"digest.{key}")
+    if root["validated_plan_count"] > root["plan_count"]:
+        raise PlanError("digest.validated_plan_count exceeds plan_count")
+    if root["accepted_attempt_count"] > root["executed_attempt_count"]:
+        raise PlanError(
+            "digest.accepted_attempt_count exceeds executed_attempt_count"
+        )
+    if root["independent_review_count"] > root["executed_attempt_count"]:
+        raise PlanError(
+            "digest.independent_review_count exceeds executed_attempt_count"
+        )
+
+    _string_list(
+        root.get("plan_ids"),
+        "digest.plan_ids",
+        identifier_pattern=PLAN_ID_RE,
+    )
+    for key in (
+        "not_executed_ready_task_ids",
+        "superseded_worker_ids",
+        "active_worker_ids_after_execution",
+        "unknown_write_path_task_ids",
+    ):
+        value = root.get(key)
+        pattern = WORKER_ID_RE if key in {
+            "superseded_worker_ids",
+            "active_worker_ids_after_execution",
+        } else TASK_ID_RE
+        _string_list(value, f"digest.{key}", identifier_pattern=pattern)
+
+    profiles = root.get("agent_profiles")
+    if not isinstance(profiles, list):
+        raise PlanError("digest.agent_profiles must be a list")
+    seen_roles: set[str] = set()
+    for index, raw in enumerate(profiles):
+        path = f"digest.agent_profiles[{index}]"
+        row = _require_object(raw, path)
+        missing = sorted(DIGEST_RENDER_PROFILE_FIELDS - set(row))
+        if missing:
+            raise PlanError(
+                f"{path} is missing fields: {', '.join(missing)}"
+            )
+        role = _require_identifier(row.get("agent_type"), f"{path}.agent_type", ROLE_RE)
+        if role in seen_roles:
+            raise PlanError(f"digest.agent_profiles contains duplicate role: {role}")
+        seen_roles.add(role)
+        _require_nonempty_string(
+            row.get("configured_model"), f"{path}.configured_model", 128
+        )
+        _require_nonempty_string(
+            row.get("configured_model_reasoning_effort"),
+            f"{path}.configured_model_reasoning_effort",
+            64,
+        )
+        for key in (
+            "executed_attempt_count",
+            "accepted_attempt_count",
+            "independent_review_count",
+        ):
+            _require_nonnegative_int(row.get(key), f"{path}.{key}")
+        if row["accepted_attempt_count"] > row["executed_attempt_count"]:
+            raise PlanError(f"{path}.accepted_attempt_count exceeds executed_attempt_count")
+        if row["independent_review_count"] > row["executed_attempt_count"]:
+            raise PlanError(
+                f"{path}.independent_review_count exceeds executed_attempt_count"
+            )
+
+    dispatch = _require_object(
+        root.get("dispatch_and_communication"),
+        "digest.dispatch_and_communication",
+    )
+    for key in sorted(DIGEST_RENDER_DISPATCH_FIELDS):
+        _require_nonnegative_int(
+            dispatch.get(key), f"digest.dispatch_and_communication.{key}"
+        )
+
+    writes = _require_object(root.get("writes_observed"), "digest.writes_observed")
+    for key in sorted(DIGEST_RENDER_WRITE_FIELDS):
+        _require_nonnegative_int(writes.get(key), f"digest.writes_observed.{key}")
+
+    anomalies = root.get("anomalies")
+    if not isinstance(anomalies, list):
+        raise PlanError("digest.anomalies must be a list")
+    for index, raw in enumerate(anomalies):
+        path = f"digest.anomalies[{index}]"
+        row = _require_object(raw, path)
+        kind = _require_nonempty_string(row.get("type"), f"{path}.type", 64)
+        if kind not in DIGEST_RENDER_ANOMALY_TYPES:
+            raise PlanError(f"{path}.type is unsupported: {kind}")
+        if kind in {"non_accepted_attempts", "unevaluated_attempts"}:
+            attempts = row.get("attempts")
+            if not isinstance(attempts, list):
+                raise PlanError(f"{path}.attempts must be a list")
+            for attempt_index, raw_attempt in enumerate(attempts):
+                attempt_path = f"{path}.attempts[{attempt_index}]"
+                attempt = _require_object(raw_attempt, attempt_path)
+                _require_identifier(
+                    attempt.get("task_id"), f"{attempt_path}.task_id", TASK_ID_RE
+                )
+                _require_nonempty_string(
+                    attempt.get("runtime_status"),
+                    f"{attempt_path}.runtime_status",
+                    32,
+                )
+                if kind == "non_accepted_attempts":
+                    _require_nonempty_string(
+                        attempt.get("task_outcome"),
+                        f"{attempt_path}.task_outcome",
+                        32,
+                    )
+        elif kind == "not_executed_ready_tasks":
+            _string_list(
+                row.get("task_ids"),
+                f"{path}.task_ids",
+                identifier_pattern=TASK_ID_RE,
+            )
+        elif kind == "active_workers_after_execution":
+            _string_list(
+                row.get("worker_ids"),
+                f"{path}.worker_ids",
+                identifier_pattern=WORKER_ID_RE,
+            )
+        else:
+            _require_nonnegative_int(row.get("plan_count"), f"{path}.plan_count")
+            _string_list(
+                row.get("task_ids"),
+                f"{path}.task_ids",
+                identifier_pattern=TASK_ID_RE,
+            )
+
+    return root
+
+
+# ---------------------------------------------------------------------------
+# Persistent audit bundles
+# ---------------------------------------------------------------------------
+
+
+def default_audit_root() -> Path:
+    explicit = os.environ.get("MULTI_AGENT_AUDIT_ROOT")
+    if explicit:
+        return Path(explicit).expanduser()
+    codex_home = os.environ.get("CODEX_HOME")
+    if codex_home:
+        return Path(codex_home).expanduser() / "audits" / "multi-agent"
+    return Path.home() / ".codex" / "audits" / "multi-agent"
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso_z(value: datetime) -> str:
+    return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
+def _parse_iso_z(value: Any, path: str) -> datetime:
+    text = _require_nonempty_string(value, path, 64)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise PlanError(f"{path} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise PlanError(f"{path} must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def _safe_slug(value: str, fallback: str, max_length: int = 48) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip().lower())
+    normalized = re.sub(r"[-_.]{2,}", "-", normalized).strip("-._")
+    if not normalized:
+        normalized = fallback
+    return normalized[:max_length].rstrip("-._") or fallback
+
+
+def _repository_key(repo_root: Path) -> tuple[str, str]:
+    resolved = repo_root.expanduser().resolve()
+    name = resolved.name or "repo"
+    slug = _safe_slug(name, "repo", 40)
+    suffix = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:8]
+    return f"{slug}-{suffix}", name
+
+
+def _retention_record(days: int | None, now: datetime) -> dict[str, Any]:
+    if days is None:
+        days = DEFAULT_AUDIT_RETENTION_DAYS
+    if type(days) is not int or days < 0:
+        raise PlanError("retention days must be a non-negative integer")
+    keep = days == 0
+    return {
+        "days": days,
+        "keep": keep,
+        "delete_after": None if keep else _iso_z(now + timedelta(days=days)),
+        "extended_for_attention": False,
+    }
+
+
+def _ensure_private_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+
+
+def _make_file_private(path: Path) -> None:
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def _write_private_json(value: dict[str, Any], path: Path) -> None:
+    _write_json(value, path)
+    _make_file_private(path)
+
+
+def _write_private_text(value: str, path: Path) -> None:
+    _write_text(value, path)
+    _make_file_private(path)
+
+
+def _audit_manifest_path(bundle: Path) -> Path:
+    return bundle / "manifest.json"
+
+
+def _read_audit_manifest(bundle: Path) -> dict[str, Any]:
+    path = _audit_manifest_path(bundle)
+    if not path.is_file():
+        raise PlanError(f"audit manifest does not exist: {path}")
+    manifest = _read_json(path)
+    if manifest.get("bundle_type") != "MULTI_AGENT_AUDIT_BUNDLE":
+        raise PlanError("audit manifest bundle_type is invalid")
+    if manifest.get("bundle_version") != AUDIT_BUNDLE_VERSION:
+        raise PlanError(
+            f"audit manifest bundle_version must equal {AUDIT_BUNDLE_VERSION}"
+        )
+    return manifest
+
+
+def _audit_output_descriptor(bundle: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "audit_id": manifest["audit_id"],
+        "audit_dir": str(bundle),
+        "manifest": str(_audit_manifest_path(bundle)),
+        "digest_json": str(bundle / "SUBAGENT_EXECUTION_DIGEST.json"),
+        "digest_markdown": str(bundle / "SUBAGENT_EXECUTION_DIGEST.md"),
+    }
+
+
+def create_audit_bundle(
+    audit_root: Path,
+    repo_root: Path,
+    task_name: str,
+    *,
+    risk: str = "normal",
+    retention_days: int | None = None,
+    keep: bool = False,
+    now: datetime | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    task_name = _require_nonempty_string(task_name, "audit.task_name", 240)
+    if risk not in {"normal", "high"}:
+        raise PlanError("audit risk must be normal or high")
+    current = now or _utc_now()
+    root = audit_root.expanduser().resolve()
+    repository = repo_root.expanduser().resolve()
+    if not repository.is_dir():
+        raise PlanError(f"repository root does not exist: {repository}")
+    repo_key, repo_name = _repository_key(repository)
+    task_slug = _safe_slug(
+        task_name,
+        "task-" + hashlib.sha256(task_name.encode("utf-8")).hexdigest()[:8],
+    )
+    timestamp = current.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    random_suffix = uuid.uuid4().hex[:8]
+    audit_id = f"{timestamp}-{task_slug}-{random_suffix}"
+    bundle = root / repo_key / audit_id
+    if bundle.exists():
+        raise PlanError(f"audit bundle already exists: {bundle}")
+    for directory in (root, root / repo_key, bundle):
+        _ensure_private_directory(directory)
+
+    if keep:
+        retention_days = 0
+    elif retention_days is None:
+        retention_days = (
+            HIGH_RISK_AUDIT_RETENTION_DAYS
+            if risk == "high"
+            else DEFAULT_AUDIT_RETENTION_DAYS
+        )
+    manifest = {
+        "bundle_type": "MULTI_AGENT_AUDIT_BUNDLE",
+        "bundle_version": AUDIT_BUNDLE_VERSION,
+        "audit_id": audit_id,
+        "status": "open",
+        "created_at": _iso_z(current),
+        "updated_at": _iso_z(current),
+        "closed_at": None,
+        "skill_release": SKILL_RELEASE,
+        "planner_version": PLANNER_VERSION,
+        "repository": {
+            "root": str(repository),
+            "name": repo_name,
+            "key": repo_key,
+        },
+        "task": {
+            "name": task_name,
+            "slug": task_slug,
+            "risk": risk,
+        },
+        "retention": _retention_record(retention_days, current),
+        "paths": {
+            "digest_json": "SUBAGENT_EXECUTION_DIGEST.json",
+            "digest_markdown": "SUBAGENT_EXECUTION_DIGEST.md",
+        },
+        "stages": [],
+        "artifacts": [],
+        "summary": None,
+        "verification": {
+            "status": "pending",
+            "verified_at": None,
+            "errors": [],
+            "warnings": [],
+        },
+    }
+    _write_private_json(manifest, _audit_manifest_path(bundle))
+    return bundle, manifest
+
+
+def allocate_audit_stage(bundle: Path, name: str) -> dict[str, Any]:
+    bundle = bundle.expanduser().resolve()
+    manifest = _read_audit_manifest(bundle)
+    if manifest.get("status") != "open":
+        raise PlanError("audit stages can only be allocated while the bundle is open")
+    display_name = _require_nonempty_string(name, "audit.stage_name", 120)
+    slug = _safe_slug(
+        display_name,
+        "stage-" + hashlib.sha256(display_name.encode("utf-8")).hexdigest()[:8],
+        40,
+    )
+    stages = manifest.get("stages")
+    if not isinstance(stages, list):
+        raise PlanError("audit manifest stages must be a list")
+    sequence = len(stages) + 1
+    prefix = f"{sequence:02d}-{slug}"
+    if any(stage.get("prefix") == prefix for stage in stages if isinstance(stage, dict)):
+        raise PlanError(f"audit stage already exists: {prefix}")
+    dispatch_dir = bundle / f"{prefix}.dispatches"
+    _ensure_private_directory(dispatch_dir)
+    relative_paths = {
+        "draft": f"{prefix}.draft.json",
+        "plan": f"{prefix}.plan.json",
+        "dispatch_dir": f"{prefix}.dispatches",
+        "execution": f"{prefix}.execution.json",
+        "summary_json": f"{prefix}.summary.json",
+        "summary_text": f"{prefix}.summary.txt",
+    }
+    stage = {
+        "sequence": sequence,
+        "name": display_name,
+        "slug": slug,
+        "prefix": prefix,
+        "plan_id": None,
+        "paths": relative_paths,
+    }
+    stages.append(stage)
+    manifest["updated_at"] = _iso_z(_utc_now())
+    _write_private_json(manifest, _audit_manifest_path(bundle))
+    return {
+        "audit_id": manifest["audit_id"],
+        "audit_dir": str(bundle),
+        "sequence": sequence,
+        "name": display_name,
+        "prefix": prefix,
+        "paths": {
+            key: str(bundle / value) for key, value in relative_paths.items()
+        },
+    }
+
+
+def _read_json_loose(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise PlanError(f"cannot parse JSON artifact {path}: {exc}") from exc
+
+
+def _classify_audit_file(path: Path) -> tuple[str, dict[str, Any]]:
+    metadata: dict[str, Any] = {}
+    if path.suffix == ".json":
+        value = _read_json_loose(path)
+        if not isinstance(value, dict):
+            return "unknown_json", metadata
+        if value.get("digest_type") == "SUBAGENT_EXECUTION_DIGEST":
+            metadata["schema_version"] = value.get("digest_version")
+            metadata["plan_ids"] = value.get("plan_ids")
+            return "digest_json", metadata
+        if value.get("summary_type") == "WORKPLAN_EXECUTION_SUMMARY":
+            metadata["schema_version"] = value.get("summary_version")
+            metadata["plan_id"] = value.get("plan_id")
+            return "summary_json", metadata
+        if (
+            value.get("version") == EXECUTION_RECORD_VERSION
+            and isinstance(value.get("workers"), list)
+            and isinstance(value.get("communication"), dict)
+        ):
+            metadata["schema_version"] = value.get("version")
+            metadata["plan_id"] = value.get("plan_id")
+            return "execution_json", metadata
+        if "planner_version" in value and "ready_task_ids" in value:
+            metadata["schema_version"] = value.get("version")
+            metadata["planner_version"] = value.get("planner_version")
+            metadata["plan_id"] = value.get("plan_id")
+            return "generated_plan_json", metadata
+        if "max_concurrent_workers" in value and "tasks" in value:
+            metadata["schema_version"] = value.get("version")
+            metadata["plan_id"] = value.get("plan_id")
+            return "draft_plan_json", metadata
+        if all(
+            key in value
+            for key in ("method", "task_name", "agent_type", "fork_turns")
+        ):
+            metadata["task_name"] = value.get("task_name")
+            metadata["agent_type"] = value.get("agent_type")
+            return "dispatch_json", metadata
+        return "unknown_json", metadata
+    if path.suffix == ".md":
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise PlanError(f"cannot read Markdown artifact {path}: {exc}") from exc
+        if text.startswith("### 子任务执行概览\n"):
+            return "digest_markdown", metadata
+        return "unknown_markdown", metadata
+    if path.suffix == ".txt":
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise PlanError(f"cannot read text artifact {path}: {exc}") from exc
+        if text.startswith("WORKPLAN_EXECUTION_SUMMARY\n"):
+            return "summary_text", metadata
+        return "unknown_text", metadata
+    return "unknown_file", metadata
+
+
+def _artifact_record(bundle: Path, path: Path) -> dict[str, Any]:
+    kind, metadata = _classify_audit_file(path)
+    record = {
+        "path": path.relative_to(bundle).as_posix(),
+        "kind": kind,
+        "size_bytes": path.stat().st_size,
+        "sha256": _sha256_file(path),
+    }
+    record.update({key: value for key, value in metadata.items() if value is not None})
+    return record
+
+
+def _scan_audit_artifacts(bundle: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    records: list[dict[str, Any]] = []
+    errors: list[str] = []
+    manifest = _audit_manifest_path(bundle)
+    for path in sorted(bundle.rglob("*")):
+        if path == manifest or path.name.startswith("."):
+            continue
+        if path.is_symlink():
+            errors.append(f"audit bundle contains symlink: {path.relative_to(bundle)}")
+            continue
+        if not path.is_file():
+            continue
+        try:
+            records.append(_artifact_record(bundle, path))
+        except (PlanError, OSError) as exc:
+            errors.append(str(exc))
+    return records, errors
+
+
+def _single_by_plan_id(
+    records: list[dict[str, Any]], kind: str, errors: list[str]
+) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for record in records:
+        if record["kind"] != kind:
+            continue
+        plan_id = record.get("plan_id")
+        if not isinstance(plan_id, str):
+            errors.append(f"{record['path']} is missing plan_id")
+            continue
+        if plan_id in result:
+            errors.append(f"duplicate {kind} for plan_id={plan_id}")
+            continue
+        result[plan_id] = record
+    return result
+
+
+def _dispatch_signature_from_file(path: Path) -> tuple[Any, ...]:
+    value = _read_json_loose(path)
+    if not isinstance(value, dict):
+        raise PlanError(f"dispatch artifact must be an object: {path}")
+    return (
+        value.get("method"),
+        value.get("task_name"),
+        value.get("agent_type"),
+        value.get("fork_turns"),
+        value.get("model"),
+        value.get("reasoning_effort"),
+    )
+
+
+def _dispatch_signature_from_worker(worker: dict[str, Any]) -> tuple[Any, ...]:
+    observed = worker.get("observed_dispatch")
+    if not isinstance(observed, dict):
+        return (None, None, worker.get("agent_type"), None, None, None)
+    return (
+        observed.get("method"),
+        observed.get("task_name"),
+        worker.get("agent_type"),
+        observed.get("fork_turns"),
+        observed.get("model_override"),
+        observed.get("reasoning_effort_override"),
+    )
+
+
+def inspect_audit_bundle(
+    bundle: Path,
+    *,
+    compare_manifest: bool,
+) -> dict[str, Any]:
+    bundle = bundle.expanduser().resolve()
+    manifest = _read_audit_manifest(bundle)
+    errors: list[str] = []
+    warnings: list[str] = []
+    records, scan_errors = _scan_audit_artifacts(bundle)
+    errors.extend(scan_errors)
+
+    drafts = _single_by_plan_id(records, "draft_plan_json", errors)
+    plans = _single_by_plan_id(records, "generated_plan_json", errors)
+    executions = _single_by_plan_id(records, "execution_json", errors)
+    summaries = _single_by_plan_id(records, "summary_json", errors)
+
+    if not plans:
+        errors.append("audit bundle must contain at least one generated WorkPlan")
+    plan_ids = set(plans)
+    if set(drafts) != plan_ids:
+        errors.append(
+            "draft/generated plan_id sets differ: "
+            f"drafts={sorted(drafts)}, plans={sorted(plan_ids)}"
+        )
+    if set(executions) != plan_ids:
+        errors.append(
+            "plan/execution plan_id sets differ: "
+            f"plans={sorted(plan_ids)}, executions={sorted(executions)}"
+        )
+    if set(summaries) != plan_ids:
+        errors.append(
+            "plan/summary plan_id sets differ: "
+            f"plans={sorted(plan_ids)}, summaries={sorted(summaries)}"
+        )
+
+    digest_records = [record for record in records if record["kind"] == "digest_json"]
+    digest_markdown_records = [
+        record for record in records if record["kind"] == "digest_markdown"
+    ]
+    if len(digest_records) != 1:
+        errors.append(
+            f"audit bundle must contain exactly one Digest JSON; found {len(digest_records)}"
+        )
+        digest: dict[str, Any] | None = None
+    else:
+        digest_path = bundle / digest_records[0]["path"]
+        digest = validate_digest_snapshot_for_render(_read_json(digest_path))
+        digest_plan_ids = set(digest.get("plan_ids", []))
+        if digest_plan_ids != plan_ids:
+            errors.append(
+                "Digest plan_ids do not match generated plans: "
+                f"digest={sorted(digest_plan_ids)}, plans={sorted(plan_ids)}"
+            )
+        if digest.get("plan_count") != len(plan_ids):
+            errors.append("Digest plan_count does not match generated plans")
+        if digest.get("validated_plan_count") != len(plan_ids):
+            errors.append("Digest validated_plan_count does not match generated plans")
+    if len(digest_markdown_records) != 1:
+        errors.append(
+            "audit bundle must contain exactly one Digest Markdown; "
+            f"found {len(digest_markdown_records)}"
+        )
+    elif digest is not None:
+        markdown_path = bundle / digest_markdown_records[0]["path"]
+        actual_markdown = markdown_path.read_text(encoding="utf-8")
+        expected_markdown = render_execution_digest(digest)
+        if actual_markdown != expected_markdown:
+            errors.append("Digest Markdown does not match deterministic renderer output")
+
+    execution_workers: list[dict[str, Any]] = []
+    accepted_attempt_count = 0
+    independent_review_count = 0
+    for plan_id, record in executions.items():
+        value = _read_json(bundle / record["path"])
+        workers = value.get("workers")
+        if isinstance(workers, list):
+            execution_workers.extend(worker for worker in workers if isinstance(worker, dict))
+            accepted_attempt_count += sum(
+                worker.get("task_outcome") == "accepted"
+                for worker in workers
+                if isinstance(worker, dict)
+            )
+        summary_record = summaries.get(plan_id)
+        if summary_record is not None:
+            summary_value = _read_json(bundle / summary_record["path"])
+            independent_review_count += sum(
+                worker.get("independent_review") is True
+                for worker in summary_value.get("workers", [])
+                if isinstance(worker, dict)
+            )
+
+    dispatch_paths = [
+        bundle / record["path"] for record in records if record["kind"] == "dispatch_json"
+    ]
+    try:
+        dispatch_signatures = Counter(
+            _dispatch_signature_from_file(path) for path in dispatch_paths
+        )
+    except PlanError as exc:
+        errors.append(str(exc))
+        dispatch_signatures = Counter()
+    worker_signatures = Counter(
+        _dispatch_signature_from_worker(worker) for worker in execution_workers
+    )
+    if dispatch_signatures != worker_signatures:
+        errors.append(
+            "dispatch artifacts do not match execution observed_dispatch records"
+        )
+
+    if digest is not None:
+        if digest.get("executed_attempt_count") != len(execution_workers):
+            errors.append("Digest executed_attempt_count does not match execution records")
+        if digest.get("accepted_attempt_count") != accepted_attempt_count:
+            errors.append("Digest accepted_attempt_count does not match execution records")
+        if digest.get("independent_review_count") != independent_review_count:
+            errors.append("Digest independent_review_count does not match summaries")
+
+    unknown_records = [
+        record
+        for record in records
+        if record["kind"].startswith("unknown_") or record["kind"] == "unknown_file"
+    ]
+    for record in unknown_records:
+        warnings.append(f"unclassified audit artifact: {record['path']}")
+
+    stages = manifest.get("stages")
+    if not isinstance(stages, list):
+        errors.append("audit manifest stages must be a list")
+        stages = []
+    if not stages:
+        warnings.append("audit bundle has no allocated stages")
+    for stage in stages:
+        if not isinstance(stage, dict):
+            errors.append("audit manifest contains a non-object stage")
+            continue
+        paths = stage.get("paths")
+        if not isinstance(paths, dict):
+            errors.append(f"audit stage {stage.get('prefix')} paths must be an object")
+            continue
+        required = {"draft", "plan", "dispatch_dir", "execution", "summary_json"}
+        missing = sorted(required - set(paths))
+        if missing:
+            errors.append(
+                f"audit stage {stage.get('prefix')} is missing paths: {', '.join(missing)}"
+            )
+            continue
+        for key in ("draft", "plan", "execution", "summary_json"):
+            if not (bundle / str(paths[key])).is_file():
+                errors.append(
+                    f"audit stage {stage.get('prefix')} is missing {key}: {paths[key]}"
+                )
+        dispatch_dir = bundle / str(paths["dispatch_dir"])
+        if not dispatch_dir.is_dir():
+            errors.append(
+                f"audit stage {stage.get('prefix')} is missing dispatch_dir: {paths['dispatch_dir']}"
+            )
+        plan_path = bundle / str(paths["plan"])
+        if plan_path.is_file():
+            plan_value = _read_json(plan_path)
+            plan_id = plan_value.get("plan_id")
+            if stage.get("plan_id") not in (None, plan_id):
+                errors.append(
+                    f"audit stage {stage.get('prefix')} plan_id does not match its plan file"
+                )
+
+    size_bytes = sum(record["size_bytes"] for record in records)
+    attention = bool(digest and digest.get("anomalies"))
+    summary = {
+        "plan_count": len(plan_ids),
+        "executed_attempt_count": len(execution_workers),
+        "accepted_attempt_count": accepted_attempt_count,
+        "independent_review_count": independent_review_count,
+        "attention_required": attention,
+        "anomaly_count": len(digest.get("anomalies", [])) if digest else 0,
+    }
+
+    if compare_manifest:
+        manifest_records = manifest.get("artifacts")
+        if not isinstance(manifest_records, list):
+            errors.append("closed audit manifest artifacts must be a list")
+        else:
+            expected_by_path = {
+                record.get("path"): record
+                for record in manifest_records
+                if isinstance(record, dict) and isinstance(record.get("path"), str)
+            }
+            actual_by_path = {record["path"]: record for record in records}
+            if set(expected_by_path) != set(actual_by_path):
+                errors.append("manifest artifact inventory does not match files on disk")
+            for path, actual in actual_by_path.items():
+                expected = expected_by_path.get(path)
+                if expected is None:
+                    continue
+                if expected.get("sha256") != actual["sha256"]:
+                    errors.append(f"artifact checksum mismatch: {path}")
+                if expected.get("size_bytes") != actual["size_bytes"]:
+                    errors.append(f"artifact size mismatch: {path}")
+        if manifest.get("status") != "closed":
+            errors.append("audit bundle is not closed")
+        verification = manifest.get("verification")
+        if not isinstance(verification, dict) or verification.get("status") != "passed":
+            errors.append("audit manifest verification status is not passed")
+
+    return {
+        "report_type": "MULTI_AGENT_AUDIT_BUNDLE_REPORT",
+        "report_version": 1,
+        "status": "passed" if not errors else "failed",
+        "audit_id": manifest.get("audit_id"),
+        "audit_dir": str(bundle),
+        "bundle_status": manifest.get("status"),
+        "artifact_count": len(records),
+        "size_bytes": size_bytes,
+        "summary": summary,
+        "artifacts": records,
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
+def finalize_audit_bundle(
+    bundle: Path,
+    *,
+    retention_days: int | None = None,
+    keep: bool = False,
+) -> dict[str, Any]:
+    bundle = bundle.expanduser().resolve()
+    manifest = _read_audit_manifest(bundle)
+    if manifest.get("status") != "open":
+        raise PlanError("only an open audit bundle can be finalized")
+
+    digest_path = bundle / "SUBAGENT_EXECUTION_DIGEST.json"
+    if digest_path.is_file():
+        digest = validate_digest_snapshot_for_render(_read_json(digest_path))
+        _write_private_text(
+            render_execution_digest(digest),
+            bundle / "SUBAGENT_EXECUTION_DIGEST.md",
+        )
+
+    for summary_path in sorted(bundle.rglob("*.json")):
+        if summary_path.name == "manifest.json":
+            continue
+        try:
+            summary = _read_json(summary_path)
+        except PlanError:
+            continue
+        if summary.get("summary_type") == "WORKPLAN_EXECUTION_SUMMARY":
+            _write_private_text(
+                render_execution_summary(summary),
+                summary_path.with_suffix(".txt"),
+            )
+
+    report = inspect_audit_bundle(bundle, compare_manifest=False)
+    now = _utc_now()
+    manifest["updated_at"] = _iso_z(now)
+    manifest["verification"] = {
+        "status": report["status"],
+        "verified_at": _iso_z(now),
+        "errors": report["errors"],
+        "warnings": report["warnings"],
+    }
+    if report["status"] != "passed":
+        _write_private_json(manifest, _audit_manifest_path(bundle))
+        return report
+
+    stages = manifest.get("stages", [])
+    for stage in stages:
+        if not isinstance(stage, dict):
+            continue
+        paths = stage.get("paths", {})
+        plan_path = bundle / str(paths.get("plan", ""))
+        if plan_path.is_file():
+            stage["plan_id"] = _read_json(plan_path).get("plan_id")
+
+    current_retention = manifest.get("retention")
+    if keep:
+        retention_days = 0
+    if retention_days is not None:
+        manifest["retention"] = _retention_record(retention_days, now)
+    elif not isinstance(current_retention, dict):
+        manifest["retention"] = _retention_record(None, now)
+    elif report["summary"]["attention_required"]:
+        days = current_retention.get("days")
+        if type(days) is int and 0 < days < HIGH_RISK_AUDIT_RETENTION_DAYS:
+            manifest["retention"] = _retention_record(
+                HIGH_RISK_AUDIT_RETENTION_DAYS, now
+            )
+            manifest["retention"]["extended_for_attention"] = True
+
+    manifest["status"] = "closed"
+    manifest["closed_at"] = _iso_z(now)
+    manifest["updated_at"] = _iso_z(now)
+    manifest["artifacts"] = report["artifacts"]
+    manifest["summary"] = report["summary"]
+    manifest["verification"] = {
+        "status": "passed",
+        "verified_at": _iso_z(now),
+        "errors": [],
+        "warnings": report["warnings"],
+    }
+    _write_private_json(manifest, _audit_manifest_path(bundle))
+    for path in bundle.rglob("*"):
+        if path.is_dir():
+            _ensure_private_directory(path)
+        elif path.is_file():
+            _make_file_private(path)
+    report["bundle_status"] = "closed"
+    return report
+
+
+def import_audit_directory(
+    audit_root: Path,
+    source: Path,
+    repo_root: Path,
+    task_name: str,
+    *,
+    risk: str = "normal",
+    retention_days: int | None = None,
+    keep: bool = False,
+) -> tuple[Path, dict[str, Any]]:
+    source = source.expanduser().resolve()
+    if not source.is_dir():
+        raise PlanError(f"audit import source does not exist: {source}")
+    root = audit_root.expanduser().resolve()
+    if root.is_relative_to(source) or source.is_relative_to(root):
+        raise PlanError("audit import source and persistent audit root must not overlap")
+    for path in source.rglob("*"):
+        if path.is_symlink():
+            raise PlanError(f"audit import refuses symlink: {path.relative_to(source)}")
+    bundle, _ = create_audit_bundle(
+        audit_root,
+        repo_root,
+        task_name,
+        risk=risk,
+        retention_days=retention_days,
+        keep=keep,
+    )
+    for path in sorted(source.rglob("*")):
+        relative = path.relative_to(source)
+        if path.is_dir():
+            _ensure_private_directory(bundle / relative)
+            continue
+        if not path.is_file() or path.name == "manifest.json":
+            continue
+        target = bundle / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+        _make_file_private(target)
+    report = finalize_audit_bundle(bundle)
+    return bundle, report
+
+
+def _audit_manifests(audit_root: Path) -> list[tuple[Path, dict[str, Any]]]:
+    root = audit_root.expanduser().resolve()
+    if not root.exists():
+        return []
+    result: list[tuple[Path, dict[str, Any]]] = []
+    for path in sorted(root.rglob("manifest.json")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        bundle = path.parent.resolve()
+        try:
+            if not bundle.is_relative_to(root):
+                continue
+            manifest = _read_audit_manifest(bundle)
+        except (PlanError, OSError):
+            continue
+        result.append((bundle, manifest))
+    return result
+
+
+def resolve_audit_bundle(
+    reference: str,
+    audit_root: Path,
+    *,
+    allow_invalid: bool = False,
+) -> Path:
+    root = audit_root.expanduser().resolve()
+    candidate = Path(reference).expanduser()
+    if candidate.exists():
+        resolved = candidate.resolve()
+        if resolved.is_file() and resolved.name == "manifest.json":
+            resolved = resolved.parent
+        if not resolved.is_relative_to(root):
+            raise PlanError(f"audit bundle is outside configured audit root: {resolved}")
+        try:
+            _read_audit_manifest(resolved)
+        except PlanError:
+            if not allow_invalid or not _audit_manifest_path(resolved).is_file():
+                raise
+        return resolved
+    matches = [
+        bundle
+        for bundle, manifest in _audit_manifests(root)
+        if manifest.get("audit_id") == reference
+    ]
+    if allow_invalid and root.exists():
+        for path in root.rglob("manifest.json"):
+            if path.is_file() and not path.is_symlink() and path.parent.name == reference:
+                matches.append(path.parent.resolve())
+    matches = sorted(set(matches))
+    if not matches:
+        raise PlanError(f"audit bundle not found: {reference}")
+    if len(matches) > 1:
+        raise PlanError(f"audit_id is ambiguous: {reference}")
+    return matches[0]
+
+
+def _audit_row(bundle: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    retention = manifest.get("retention") if isinstance(manifest.get("retention"), dict) else {}
+    summary = manifest.get("summary") if isinstance(manifest.get("summary"), dict) else {}
+    size_bytes = 0
+    for path in bundle.rglob("*"):
+        if path.is_file() and not path.is_symlink():
+            try:
+                size_bytes += path.stat().st_size
+            except OSError:
+                pass
+    return {
+        "audit_id": manifest.get("audit_id"),
+        "bundle_version": manifest.get("bundle_version"),
+        "skill_release": manifest.get("skill_release"),
+        "planner_version": manifest.get("planner_version"),
+        "status": manifest.get("status"),
+        "created_at": manifest.get("created_at"),
+        "closed_at": manifest.get("closed_at"),
+        "delete_after": retention.get("delete_after"),
+        "keep": retention.get("keep", False),
+        "risk": manifest.get("task", {}).get("risk") if isinstance(manifest.get("task"), dict) else None,
+        "repository": manifest.get("repository", {}).get("name") if isinstance(manifest.get("repository"), dict) else None,
+        "task_name": manifest.get("task", {}).get("name") if isinstance(manifest.get("task"), dict) else None,
+        "attention_required": summary.get("attention_required", False),
+        "plan_count": summary.get("plan_count"),
+        "accepted_attempt_count": summary.get("accepted_attempt_count"),
+        "size_bytes": size_bytes,
+        "path": str(bundle),
+    }
+
+
+def list_audit_bundles(
+    audit_root: Path,
+    *,
+    status: str | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    if status not in {None, "open", "closed", "invalid"}:
+        raise PlanError("audit status filter must be open, closed, or invalid")
+    root = audit_root.expanduser().resolve()
+    rows: list[dict[str, Any]] = []
+    valid_manifest_paths: set[Path] = set()
+    for bundle, manifest in _audit_manifests(root):
+        valid_manifest_paths.add(_audit_manifest_path(bundle).resolve())
+        if status is None or manifest.get("status") == status:
+            rows.append(_audit_row(bundle, manifest))
+    if root.exists() and status in {None, "invalid"}:
+        for path in sorted(root.rglob("manifest.json")):
+            resolved = path.resolve()
+            if resolved in valid_manifest_paths or path.is_symlink() or not path.is_file():
+                continue
+            try:
+                size_bytes = sum(
+                    child.stat().st_size
+                    for child in path.parent.rglob("*")
+                    if child.is_file() and not child.is_symlink()
+                )
+            except OSError:
+                size_bytes = 0
+            rows.append(
+                {
+                    "audit_id": path.parent.name,
+                    "bundle_version": None,
+                    "skill_release": None,
+                    "planner_version": None,
+                    "status": "invalid",
+                    "created_at": None,
+                    "closed_at": None,
+                    "delete_after": None,
+                    "keep": False,
+                    "risk": None,
+                    "repository": path.parent.parent.name,
+                    "task_name": "<unreadable manifest>",
+                    "attention_required": True,
+                    "plan_count": None,
+                    "accepted_attempt_count": None,
+                    "size_bytes": size_bytes,
+                    "path": str(path.parent),
+                }
+            )
+    rows.sort(key=lambda row: str(row.get("created_at") or ""), reverse=True)
+    if limit is not None:
+        if type(limit) is not int or limit < 1:
+            raise PlanError("audit list limit must be a positive integer")
+        rows = rows[:limit]
+    return rows
+
+
+def show_audit_bundle(bundle: Path) -> dict[str, Any]:
+    manifest = _read_audit_manifest(bundle)
+    return {
+        **manifest,
+        "audit_dir": str(bundle),
+        "size_bytes": _audit_row(bundle, manifest)["size_bytes"],
+    }
+
+
+def delete_audit_bundle(
+    bundle: Path,
+    *,
+    confirmed: bool,
+    force: bool,
+) -> dict[str, Any]:
+    if not confirmed:
+        raise PlanError("audit-delete requires --yes")
+    try:
+        manifest = _read_audit_manifest(bundle)
+    except PlanError:
+        if not force:
+            raise
+        manifest = {
+            "audit_id": bundle.name,
+            "status": "invalid",
+            "summary": {},
+            "verification": {},
+        }
+    summary = manifest.get("summary") if isinstance(manifest.get("summary"), dict) else {}
+    verification = (
+        manifest.get("verification")
+        if isinstance(manifest.get("verification"), dict)
+        else {}
+    )
+    if not force:
+        if manifest.get("status") != "closed":
+            raise PlanError("refusing to delete an open audit bundle without --force")
+        if verification.get("status") != "passed":
+            raise PlanError("refusing to delete an unverified audit bundle without --force")
+        current_report = inspect_audit_bundle(bundle, compare_manifest=True)
+        if current_report["status"] != "passed":
+            raise PlanError(
+                "refusing to delete an audit bundle that no longer passes verification "
+                "without --force"
+            )
+        if current_report["summary"].get("attention_required") or summary.get(
+            "attention_required"
+        ):
+            raise PlanError("refusing to delete an audit bundle with anomalies without --force")
+    audit_id = manifest.get("audit_id")
+    path = str(bundle)
+    shutil.rmtree(bundle)
+    parent = bundle.parent
+    try:
+        if parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
+    except OSError:
+        pass
+    return {
+        "report_type": "MULTI_AGENT_AUDIT_DELETE",
+        "status": "deleted",
+        "audit_id": audit_id,
+        "path": path,
+    }
+
+
+def prune_audit_bundles(
+    audit_root: Path,
+    *,
+    apply: bool,
+    include_attention: bool,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    current = now or _utc_now()
+    selected: list[dict[str, Any]] = []
+    skipped_attention: list[str] = []
+    skipped_unverified: list[str] = []
+    for bundle, manifest in _audit_manifests(audit_root):
+        if manifest.get("status") != "closed":
+            continue
+        verification = manifest.get("verification")
+        if not isinstance(verification, dict) or verification.get("status") != "passed":
+            continue
+        retention = manifest.get("retention")
+        if not isinstance(retention, dict) or retention.get("keep"):
+            continue
+        delete_after = retention.get("delete_after")
+        if delete_after is None:
+            continue
+        try:
+            expired = _parse_iso_z(delete_after, "audit.retention.delete_after") <= current
+        except PlanError:
+            continue
+        if not expired:
+            continue
+        current_report = inspect_audit_bundle(bundle, compare_manifest=True)
+        if current_report["status"] != "passed":
+            skipped_unverified.append(str(manifest.get("audit_id")))
+            continue
+        summary = current_report["summary"]
+        if summary.get("attention_required") and not include_attention:
+            skipped_attention.append(str(manifest.get("audit_id")))
+            continue
+        row = _audit_row(bundle, manifest)
+        selected.append(row)
+        if apply:
+            shutil.rmtree(bundle)
+            try:
+                if bundle.parent.is_dir() and not any(bundle.parent.iterdir()):
+                    bundle.parent.rmdir()
+            except OSError:
+                pass
+    return {
+        "report_type": "MULTI_AGENT_AUDIT_PRUNE",
+        "status": "applied" if apply else "dry-run",
+        "audit_root": str(audit_root.expanduser().resolve()),
+        "selected_count": len(selected),
+        "selected": selected,
+        "skipped_attention_audit_ids": skipped_attention,
+        "skipped_unverified_audit_ids": skipped_unverified,
+    }
+
+
+def render_audit_bundle_report(report: dict[str, Any]) -> str:
+    lines = [
+        "MULTI_AGENT_AUDIT_BUNDLE",
+        f"status: {report['status']}",
+        f"audit_id: {report.get('audit_id')}",
+        f"audit_dir: {report.get('audit_dir')}",
+        f"bundle_status: {report.get('bundle_status')}",
+        f"artifact_count: {report.get('artifact_count')}",
+        f"size_bytes: {report.get('size_bytes')}",
+        "summary: " + _json_inline(report.get("summary")),
+    ]
+    if report.get("errors"):
+        lines.append("errors:")
+        lines.extend(f"  - {item}" for item in report["errors"])
+    else:
+        lines.append("errors: []")
+    if report.get("warnings"):
+        lines.append("warnings:")
+        lines.extend(f"  - {item}" for item in report["warnings"])
+    else:
+        lines.append("warnings: []")
+    return "\n".join(lines) + "\n"
+
+
+def render_audit_list(rows: list[dict[str, Any]], audit_root: Path) -> str:
+    lines = [
+        f"MULTI_AGENT_AUDITS root={audit_root.expanduser().resolve()}",
+        "audit_id | bundle | skill | status | attention | delete_after | repository | task | size_bytes",
+    ]
+    if not rows:
+        lines.append("(none)")
+        return "\n".join(lines) + "\n"
+    for row in rows:
+        lines.append(
+            " | ".join(
+                [
+                    str(row.get("audit_id")),
+                    str(row.get("bundle_version") or "?"),
+                    str(row.get("skill_release") or "?"),
+                    str(row.get("status")),
+                    "yes" if row.get("attention_required") else "no",
+                    str(row.get("delete_after") or "keep"),
+                    str(row.get("repository") or "unknown"),
+                    str(row.get("task_name") or "unknown"),
+                    str(row.get("size_bytes") or 0),
+                ]
+            )
+        )
+    return "\n".join(lines) + "\n"
+
+
+def render_audit_show(value: dict[str, Any]) -> str:
+    retention = value.get("retention") if isinstance(value.get("retention"), dict) else {}
+    summary = value.get("summary") if isinstance(value.get("summary"), dict) else {}
+    lines = [
+        "MULTI_AGENT_AUDIT",
+        f"audit_id: {value.get('audit_id')}",
+        f"bundle_version: {value.get('bundle_version')}",
+        f"skill_release: {value.get('skill_release')}",
+        f"planner_version: {value.get('planner_version')}",
+        f"status: {value.get('status')}",
+        f"task: {value.get('task', {}).get('name') if isinstance(value.get('task'), dict) else None}",
+        f"repository: {value.get('repository', {}).get('root') if isinstance(value.get('repository'), dict) else None}",
+        f"created_at: {value.get('created_at')}",
+        f"closed_at: {value.get('closed_at')}",
+        f"delete_after: {retention.get('delete_after') or 'keep'}",
+        f"size_bytes: {value.get('size_bytes')}",
+        f"summary: {_json_inline(summary)}",
+        f"audit_dir: {value.get('audit_dir')}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def render_audit_prune(report: dict[str, Any]) -> str:
+    lines = [
+        "MULTI_AGENT_AUDIT_PRUNE",
+        f"status: {report['status']}",
+        f"audit_root: {report['audit_root']}",
+        f"selected_count: {report['selected_count']}",
+    ]
+    for row in report["selected"]:
+        lines.append(f"  - {row['audit_id']}: {row['path']}")
+    if report["skipped_attention_audit_ids"]:
+        lines.append(
+            "skipped_attention: "
+            + ", ".join(report["skipped_attention_audit_ids"])
+        )
+    else:
+        lines.append("skipped_attention: []")
+    if report["skipped_unverified_audit_ids"]:
+        lines.append(
+            "skipped_unverified: "
+            + ", ".join(report["skipped_unverified_audit_ids"])
+        )
+    else:
+        lines.append("skipped_unverified: []")
+    return "\n".join(lines) + "\n"
+
+def build_doctor_report(
+    roles: RoleRegistry,
+    codex_config: dict[str, Any],
+    audit_root: Path | None = None,
+) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
     raw = codex_config.get("raw", {})
@@ -1781,6 +3167,23 @@ def build_doctor_report(roles: RoleRegistry, codex_config: dict[str, Any]) -> di
             warnings.append(
                 "[agents].default_subagent_reasoning_effort 未显式配置，仅影响未命名回退角色。"
             )
+    audit_info: dict[str, Any] | None = None
+    if audit_root is not None:
+        root = audit_root.expanduser().resolve()
+        exists = root.exists()
+        writable = root.is_dir() and os.access(root, os.W_OK) if exists else False
+        audit_info = {
+            "path": str(root),
+            "exists": exists,
+            "writable": writable,
+        }
+        if exists and not root.is_dir():
+            errors.append("persistent audit root exists but is not a directory")
+        elif exists and not writable:
+            errors.append("persistent audit root is not writable")
+        elif not exists:
+            warnings.append("persistent audit root does not exist yet; audit-init will create it")
+
     return {
         "report_type": "MULTI_AGENT_ORCHESTRATION_DOCTOR",
         "report_version": DOCTOR_VERSION,
@@ -1795,6 +3198,7 @@ def build_doctor_report(roles: RoleRegistry, codex_config: dict[str, Any]) -> di
                 "configured_max_concurrent_threads_per_session"
             ),
         },
+        "audit_root": audit_info,
         "errors": errors,
         "warnings": warnings,
     }
@@ -1879,6 +3283,7 @@ def _markdown_code(value: Any) -> str:
 
 
 def render_execution_digest(digest: dict[str, Any]) -> str:
+    digest = validate_digest_snapshot_for_render(digest)
     lines = [
         "### 子任务执行概览",
         "",
@@ -1969,6 +3374,7 @@ def render_doctor(report: dict[str, Any]) -> str:
         f"planner_version: {report['planner_version']}",
         f"role_count: {report['role_count']}",
         "codex_config: " + _json_inline(report["codex_config"]),
+        "audit_root: " + _json_inline(report.get("audit_root")),
     ]
     if report["errors"]:
         lines.append("errors:")
@@ -2031,7 +3437,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=default_codex_config(),
         help="Codex config.toml used for capacity and doctor checks.",
     )
+    parser.add_argument(
+        "--audit-root",
+        type=Path,
+        default=default_audit_root(),
+        help=(
+            "Persistent audit root. Defaults to "
+            "$MULTI_AGENT_AUDIT_ROOT or $CODEX_HOME/audits/multi-agent."
+        ),
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
     plan_parser = subparsers.add_parser("plan", help="Validate a draft and assign waves.")
     plan_parser.add_argument("input", type=Path)
     plan_parser.add_argument("--output", type=Path)
@@ -2060,6 +3476,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     digest_parser.add_argument("--output", type=Path)
     digest_parser.add_argument("--json", action="store_true")
+    render_digest_parser = subparsers.add_parser(
+        "render-digest",
+        help=(
+            "Render an existing validated Digest JSON snapshot without "
+            "re-reading current Agent TOMLs or config.toml."
+        ),
+    )
+    render_digest_parser.add_argument("input", type=Path)
+    render_digest_parser.add_argument("--output", type=Path)
     guard_parser = subparsers.add_parser(
         "guard-dispatch",
         help="Validate a normalized spawn_agent/followup_task payload before dispatch.",
@@ -2067,12 +3492,104 @@ def build_parser() -> argparse.ArgumentParser:
     guard_parser.add_argument("plan", type=Path)
     guard_parser.add_argument("task_id")
     guard_parser.add_argument("dispatch", type=Path)
+    guard_parser.add_argument(
+        "--audit",
+        required=True,
+        help=(
+            "Persistent audit ID or bundle path. The plan and normalized "
+            "dispatch files must belong to the same allocated open stage."
+        ),
+    )
     guard_parser.add_argument("--output", type=Path)
     doctor_parser = subparsers.add_parser(
         "doctor", help="Check fixed-profile Agent TOMLs and Codex runtime configuration."
     )
     doctor_parser.add_argument("--output", type=Path)
     doctor_parser.add_argument("--json", action="store_true")
+
+    audit_init_parser = subparsers.add_parser(
+        "audit-init",
+        help="Create a persistent versioned audit bundle and print its directory.",
+    )
+    audit_init_parser.add_argument("--task-name", required=True)
+    audit_init_parser.add_argument("--repo-root", type=Path, default=Path.cwd())
+    audit_init_parser.add_argument("--risk", choices=("normal", "high"), default="normal")
+    audit_init_parser.add_argument("--retention-days", type=int)
+    audit_init_parser.add_argument("--keep", action="store_true")
+    audit_init_parser.add_argument("--json", action="store_true")
+    audit_init_parser.add_argument("--output", type=Path)
+
+    audit_import_parser = subparsers.add_parser(
+        "audit-import",
+        help="Import an existing temporary audit directory into persistent storage.",
+    )
+    audit_import_parser.add_argument("source", type=Path)
+    audit_import_parser.add_argument("--task-name", required=True)
+    audit_import_parser.add_argument("--repo-root", type=Path, default=Path.cwd())
+    audit_import_parser.add_argument("--risk", choices=("normal", "high"), default="normal")
+    audit_import_parser.add_argument("--retention-days", type=int)
+    audit_import_parser.add_argument("--keep", action="store_true")
+    audit_import_parser.add_argument("--json", action="store_true")
+    audit_import_parser.add_argument("--output", type=Path)
+
+    audit_stage_parser = subparsers.add_parser(
+        "audit-stage",
+        help="Allocate deterministic artifact paths for one WorkPlan stage.",
+    )
+    audit_stage_parser.add_argument("audit")
+    audit_stage_parser.add_argument("--name", required=True)
+    audit_stage_parser.add_argument("--output", type=Path)
+
+    audit_finalize_parser = subparsers.add_parser(
+        "audit-finalize",
+        help="Render missing human-readable artifacts, verify, checksum, and close a bundle.",
+    )
+    audit_finalize_parser.add_argument("audit")
+    audit_finalize_parser.add_argument("--retention-days", type=int)
+    audit_finalize_parser.add_argument("--keep", action="store_true")
+    audit_finalize_parser.add_argument("--json", action="store_true")
+    audit_finalize_parser.add_argument("--output", type=Path)
+
+    audit_verify_parser = subparsers.add_parser(
+        "audit-verify",
+        help="Verify a closed bundle against its versioned manifest and checksums.",
+    )
+    audit_verify_parser.add_argument("audit")
+    audit_verify_parser.add_argument("--json", action="store_true")
+    audit_verify_parser.add_argument("--output", type=Path)
+
+    audit_list_parser = subparsers.add_parser(
+        "audit-list", help="List discoverable persistent audit bundles."
+    )
+    audit_list_parser.add_argument("--status", choices=("open", "closed", "invalid"))
+    audit_list_parser.add_argument("--limit", type=int)
+    audit_list_parser.add_argument("--json", action="store_true")
+    audit_list_parser.add_argument("--output", type=Path)
+
+    audit_show_parser = subparsers.add_parser(
+        "audit-show", help="Show one audit bundle by path or audit_id."
+    )
+    audit_show_parser.add_argument("audit")
+    audit_show_parser.add_argument("--json", action="store_true")
+    audit_show_parser.add_argument("--output", type=Path)
+
+    audit_delete_parser = subparsers.add_parser(
+        "audit-delete", help="Safely delete one audit bundle by path or audit_id."
+    )
+    audit_delete_parser.add_argument("audit")
+    audit_delete_parser.add_argument("--yes", action="store_true")
+    audit_delete_parser.add_argument("--force", action="store_true")
+    audit_delete_parser.add_argument("--json", action="store_true")
+    audit_delete_parser.add_argument("--output", type=Path)
+
+    audit_prune_parser = subparsers.add_parser(
+        "audit-prune",
+        help="Dry-run or delete closed audit bundles whose retention has expired.",
+    )
+    audit_prune_parser.add_argument("--apply", action="store_true")
+    audit_prune_parser.add_argument("--include-attention", action="store_true")
+    audit_prune_parser.add_argument("--json", action="store_true")
+    audit_prune_parser.add_argument("--output", type=Path)
     return parser
 
 
@@ -2080,6 +3597,131 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "render-digest":
+            _write_text(render_execution_digest(_read_json(args.input)), args.output)
+            return 0
+
+        if args.command == "audit-init":
+            bundle, manifest = create_audit_bundle(
+                args.audit_root,
+                args.repo_root,
+                args.task_name,
+                risk=args.risk,
+                retention_days=args.retention_days,
+                keep=args.keep,
+            )
+            descriptor = _audit_output_descriptor(bundle, manifest)
+            if args.json:
+                _write_json(descriptor, args.output)
+            elif args.output is not None:
+                _write_text(str(bundle) + "\n", args.output)
+            else:
+                print(bundle)
+            return 0
+
+        if args.command == "audit-import":
+            bundle, report = import_audit_directory(
+                args.audit_root,
+                args.source,
+                args.repo_root,
+                args.task_name,
+                risk=args.risk,
+                retention_days=args.retention_days,
+                keep=args.keep,
+            )
+            report["audit_dir"] = str(bundle)
+            if args.json:
+                _write_json(report, args.output)
+            else:
+                _write_text(render_audit_bundle_report(report), args.output)
+            return 0 if report["status"] == "passed" else 2
+
+        if args.command == "audit-stage":
+            bundle = resolve_audit_bundle(args.audit, args.audit_root)
+            _write_json(allocate_audit_stage(bundle, args.name), args.output)
+            return 0
+
+        if args.command == "audit-finalize":
+            bundle = resolve_audit_bundle(args.audit, args.audit_root)
+            report = finalize_audit_bundle(
+                bundle,
+                retention_days=args.retention_days,
+                keep=args.keep,
+            )
+            if args.json:
+                _write_json(report, args.output)
+            else:
+                _write_text(render_audit_bundle_report(report), args.output)
+            return 0 if report["status"] == "passed" else 2
+
+        if args.command == "audit-verify":
+            bundle = resolve_audit_bundle(args.audit, args.audit_root)
+            report = inspect_audit_bundle(bundle, compare_manifest=True)
+            if args.json:
+                _write_json(report, args.output)
+            else:
+                _write_text(render_audit_bundle_report(report), args.output)
+            return 0 if report["status"] == "passed" else 2
+
+        if args.command == "audit-list":
+            rows = list_audit_bundles(
+                args.audit_root,
+                status=args.status,
+                limit=args.limit,
+            )
+            if args.json:
+                _write_json(
+                    {
+                        "report_type": "MULTI_AGENT_AUDIT_LIST",
+                        "audit_root": str(args.audit_root.expanduser().resolve()),
+                        "count": len(rows),
+                        "audits": rows,
+                    },
+                    args.output,
+                )
+            else:
+                _write_text(render_audit_list(rows, args.audit_root), args.output)
+            return 0
+
+        if args.command == "audit-show":
+            bundle = resolve_audit_bundle(args.audit, args.audit_root)
+            value = show_audit_bundle(bundle)
+            if args.json:
+                _write_json(value, args.output)
+            else:
+                _write_text(render_audit_show(value), args.output)
+            return 0
+
+        if args.command == "audit-delete":
+            bundle = resolve_audit_bundle(
+                args.audit, args.audit_root, allow_invalid=args.force
+            )
+            report = delete_audit_bundle(
+                bundle,
+                confirmed=args.yes,
+                force=args.force,
+            )
+            if args.json:
+                _write_json(report, args.output)
+            else:
+                _write_text(
+                    f"deleted: {report['audit_id']}\npath: {report['path']}\n",
+                    args.output,
+                )
+            return 0
+
+        if args.command == "audit-prune":
+            report = prune_audit_bundles(
+                args.audit_root,
+                apply=args.apply,
+                include_attention=args.include_attention,
+            )
+            if args.json:
+                _write_json(report, args.output)
+            else:
+                _write_text(render_audit_prune(report), args.output)
+            return 0
+
         roles = load_roles(args.agents_dir)
         codex_config = load_codex_config(
             args.codex_config, required=args.command == "doctor"
@@ -2110,6 +3752,10 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 _write_text(render_execution_digest(digest), args.output)
         elif args.command == "guard-dispatch":
+            bundle = resolve_audit_bundle(args.audit, args.audit_root)
+            audit_membership = guard_audit_membership(
+                bundle, args.plan, args.dispatch
+            )
             result = guard_dispatch(
                 _read_json(args.plan),
                 args.task_id,
@@ -2117,9 +3763,10 @@ def main(argv: list[str] | None = None) -> int:
                 roles,
                 codex_config,
             )
+            result.update(audit_membership)
             _write_json(result, args.output)
         else:
-            report = build_doctor_report(roles, codex_config)
+            report = build_doctor_report(roles, codex_config, args.audit_root)
             if args.json:
                 _write_json(report, args.output)
             else:

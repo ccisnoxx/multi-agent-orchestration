@@ -56,24 +56,24 @@ if [ "$SOURCE" = "$TARGET" ]; then
 fi
 
 if [ "$SKIP_TESTS" -eq 0 ]; then
-  echo "[1/4] 验证源目录"
+  echo "[1/5] 验证源目录"
   "$SOURCE/bin/verify-skill"
 else
-  echo "[1/4] 跳过源目录测试"
+  echo "[1/5] 跳过源目录测试"
 fi
 
 mkdir -p "$(dirname "$TARGET")"
 if [ -d "$TARGET" ] && [ "$NO_BACKUP" -eq 0 ]; then
   timestamp=$(date +%Y%m%d-%H%M%S)
   backup="${TARGET}.backup-${timestamp}"
-  echo "[2/4] 备份现有目录到 $backup"
+  echo "[2/5] 备份现有目录到 $backup"
   cp -a "$TARGET" "$backup"
 else
-  echo "[2/4] 无需备份"
+  echo "[2/5] 无需备份"
 fi
 
 mkdir -p "$TARGET"
-echo "[3/4] 同步到 $TARGET"
+echo "[3/5] 同步到 $TARGET"
 rsync -a --delete \
   --exclude '.git/' \
   --exclude '.venv/' \
@@ -89,14 +89,19 @@ chmod +x \
   "$TARGET/scripts/verify_skill.py" \
   "$TARGET/scripts/install_macos.sh"
 
+AUDIT_ROOT=${MULTI_AGENT_AUDIT_ROOT:-${CODEX_HOME:-$HOME/.codex}/audits/multi-agent}
+echo "[4/5] 初始化持久化审计目录 $AUDIT_ROOT"
+mkdir -p "$AUDIT_ROOT"
+chmod 700 "$AUDIT_ROOT" 2>/dev/null || true
+
 if [ "$SKIP_DOCTOR" -eq 0 ]; then
-  echo "[4/4] 检查当前 Codex 配置"
+  echo "[5/5] 检查当前 Codex 配置"
   "$TARGET/bin/work-plan" \
     --agents-dir "${CODEX_AGENTS_DIR:-$HOME/.codex/agents}" \
     --codex-config "${CODEX_CONFIG:-$HOME/.codex/config.toml}" \
     doctor
 else
-  echo "[4/4] 跳过 Doctor"
+  echo "[5/5] 跳过 Doctor"
 fi
 
 cat <<EOF
@@ -108,6 +113,6 @@ cat <<EOF
   git status --short
   git diff --stat
   git add .
-  git commit -m "fix: use the dedicated Python runtime for local verification"
+  git commit -m "feat: add persistent multi-agent audit bundles"
   git push origin main
 EOF

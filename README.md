@@ -1,20 +1,21 @@
 # multi-agent-orchestration
 
-面向 Codex 固定角色 Profile 的多子代理编排 Skill，以及本地确定性的 WorkPlan Planner、Validator、Execution Summary、Digest 和 Doctor。
+面向 Codex 固定角色 Profile 的多子代理编排 Skill，以及本地确定性的 WorkPlan、执行审计和持久化 Audit Bundle 生命周期工具。
 
-## 1.5.1 重点
+## 1.6.0 重点
 
+- 所有实际子代理任务先创建持久化 Audit Bundle，默认位于 `$CODEX_HOME/audits/multi-agent`；
+- `audit-stage` 为每个 WorkPlan 阶段分配稳定、可发现的 draft、plan、dispatch、execution 和 summary 路径；
+- `audit-finalize` 自动生成 Markdown Digest、文本 Summary、文件清单、schema 版本、SHA-256 和关闭状态；
+- `audit-list`、`audit-show`、`audit-verify` 提供发现、查看和完整性审计；
+- `audit-delete` 使用显式确认安全删除，默认保护 open、未验证或有异常的 Bundle；
+- `audit-prune` 按 retention 执行 dry-run 或批量清理；
+- `audit-import` 可把既有 `/tmp` 审计目录迁移到持久化存储；
+- 普通成功任务默认保留 14 天，高风险任务默认 90 天；异常 Bundle 会自动延长到至少 90 天；
 - 固定角色模型、推理档位和 sandbox，不允许 spawn 时临时覆盖；
-- fresh Worker 强制 `fork_turns: "none"`，并提供可由 hook 调用的 `guard-dispatch` 门禁；
-- 默认派发调查、实现、验证、修正和交付的完整任务闭环；
-- 普通进度不汇报，使用完成通知和长有界等待；
-- 同一工作流延续优先复用合格 Worker；独立复核和 retry 使用 fresh Worker；
-- 复用仍有效的测试证据，不重复整轮验证；
-- Planner 读取 Codex 配置并约束实际并发容量；
-- execution record 校验实际派发参数、写入路径和通信统计；
-- 修复 retry 可能 supersede 错误 Worker 的交叉身份漏洞；
-- 示例与 CLI 由端到端测试保持同步；
-- 验证、示例再生成和 WorkPlan CLI 统一使用 Skill 专属 Python，不依赖 macOS 系统 Python。
+- fresh Worker 强制 `fork_turns: "none"`，并提供 `guard-dispatch` 门禁；
+- `guard-dispatch` 必须绑定 open Audit Bundle，且 plan/dispatch 必须属于同一已分配 stage；
+- Digest JSON 是机器事实源，Markdown 只从该快照确定性渲染。
 
 ## 目录职责
 
@@ -23,17 +24,19 @@
 - `references/work-plan.md`：完整协议；
 - `examples/`：可实际运行的 schema 5/6 示例；
 - `tests/`：单元与端到端测试；
-- `scripts/install_macos.sh`：保留目标 `.git` 的 macOS 原位替换脚本。
+- `scripts/install_macos.sh`：保留目标 `.git` 的 macOS 原位替换脚本，并初始化私有 Audit Root。
 
 ## 当前版本
 
 ```text
+Skill release           1.6.0
 Planner                 1.5.1
 WorkPlan schema         5
 Execution record        6
 Summary schema          3
 Digest schema           3
-Doctor report           1
+Doctor report           2
+Audit Bundle            1
 ```
 
 ## Python
@@ -78,6 +81,108 @@ uv pip install \
 ./bin/regenerate-examples
 ```
 
+## 持久化审计目录
+
+默认根目录：
+
+```text
+${MULTI_AGENT_AUDIT_ROOT:-${CODEX_HOME:-$HOME/.codex}/audits/multi-agent}
+```
+
+每个实际使用子代理的用户任务先创建一个版本化 Bundle：
+
+```bash
+AUDIT_DIR=$(./bin/work-plan audit-init \
+  --repo-root "$PWD" \
+  --task-name "修复认证缓存")
+```
+
+输出目录类似：
+
+```text
+~/.codex/audits/multi-agent/<repo-key>/<timestamp>-<task-slug>-<id>/
+```
+
+为每个计划阶段分配稳定路径：
+
+```bash
+./bin/work-plan audit-stage "$AUDIT_DIR" \
+  --name implementation \
+  --output /tmp/audit-stage.json
+```
+
+`audit-stage` 返回：
+
+```text
+<stage>.draft.json
+<stage>.plan.json
+<stage>.dispatches/<task-id>.json
+<stage>.execution.json
+<stage>.summary.json
+<stage>.summary.txt
+```
+
+完成全部阶段并生成 Digest JSON 后关闭 Bundle：
+
+```bash
+./bin/work-plan audit-finalize "$AUDIT_DIR"
+./bin/work-plan audit-verify "$AUDIT_DIR"
+```
+
+`audit-finalize` 会生成或规范化 Markdown Digest、文本 Summary、manifest、artifact SHA-256、schema 版本和 retention 信息，并把目录权限收紧为本机用户可读。
+
+发现和管理：
+
+```bash
+./bin/work-plan audit-list
+./bin/work-plan audit-show AUDIT_ID
+./bin/work-plan audit-verify AUDIT_ID
+./bin/work-plan audit-delete AUDIT_ID --yes
+./bin/work-plan audit-prune             # dry-run
+./bin/work-plan audit-prune --apply     # 删除已到期、已关闭、校验通过且无异常的 Bundle
+```
+
+有异常、未关闭或未验证的 Bundle 默认不能删除；确有需要时显式使用：
+
+```bash
+./bin/work-plan audit-delete AUDIT_ID --yes --force
+```
+
+迁移已有临时目录：
+
+```bash
+./bin/work-plan audit-import /tmp/mao-write-smoke-audit \
+  --repo-root /private/tmp/mao-write-smoke \
+  --task-name "calc.add smoke test"
+```
+
+Retention：普通任务默认 14 天，高风险任务默认 90 天，`--keep` 永久保留，`--retention-days N` 可覆盖。`audit-prune` 默认只预览，避免误删。
+
+## 用户可见 Digest
+
+使用 WorkPlan 并实际派发 Worker 时，先生成经过完整重新校验的机器审计 JSON，再从该不可变快照生成用户可见 Markdown：
+
+```bash
+./bin/work-plan digest \
+  --entry PLAN-A.json EXECUTION-A.json \
+  --entry PLAN-B.json EXECUTION-B.json \
+  --json \
+  --output "$AUDIT_DIR/SUBAGENT_EXECUTION_DIGEST.json"
+
+./bin/work-plan render-digest \
+  "$AUDIT_DIR/SUBAGENT_EXECUTION_DIGEST.json" \
+  --output "$AUDIT_DIR/SUBAGENT_EXECUTION_DIGEST.md"
+```
+
+`digest` 会重新读取当前 Agent TOML 和 `config.toml`，用于发现配置漂移。历史 JSON Digest 已经通过校验后，只需补生成或重建 Markdown 时必须使用 `render-digest`；不得再次运行 `digest` 规避或覆盖历史配置证据。
+
+最终回复中的“子任务执行概览”直接复用 `SUBAGENT_EXECUTION_DIGEST.md` 的 renderer 输出。不得根据 JSON 手工重建、合并或重排表头和统计列。固定表头为：
+
+```markdown
+| `agent_type` | 模型（Agent TOML） | 推理档位 | 执行尝试 | 验收通过 | 独立复核 |
+|---|---|---|---:|---:|---:|
+```
+
 ## 配置检查
 
 ```bash
@@ -94,7 +199,7 @@ Doctor 校验固定 Profile 和推荐的 `multi_agent_v2` 文件配置，但不�
 解压后在新目录中执行：
 
 ```bash
-cd /path/to/multi-agent-orchestration-1.5.1
+cd /path/to/multi-agent-orchestration-1.6.0
 ./scripts/install_macos.sh \
   --target /Users/sc/.codex/skills/multi-agent-orchestration
 ```
@@ -105,7 +210,8 @@ cd /path/to/multi-agent-orchestration-1.5.1
 2. 备份现有目标目录；
 3. 使用 `rsync --delete` 同步新版本；
 4. 保留目标目录已有的 `.git/` 和 `.venv/`；
-5. 运行目标目录的 `doctor`。
+5. 初始化权限为 `0700` 的持久化 Audit Root；
+6. 运行目标目录的 `doctor`。
 
 不运行 Doctor：
 
@@ -124,7 +230,7 @@ cd /Users/sc/.codex/skills/multi-agent-orchestration
 git status --short
 git diff --stat
 git add .
-git commit -m "fix: use the dedicated Python runtime for local verification"
+git commit -m "feat: add persistent multi-agent audit bundles"
 git push origin main
 ```
 
@@ -146,7 +252,11 @@ git push origin main
 - `validate`
 - `summary`
 - `digest`
+- `render-digest`
 - `guard-dispatch`
 - `doctor`
+- `audit-init` / `audit-import` / `audit-stage`
+- `audit-finalize` / `audit-verify`
+- `audit-list` / `audit-show` / `audit-delete` / `audit-prune`
 
 完整字段与示例见 `references/work-plan.md`。

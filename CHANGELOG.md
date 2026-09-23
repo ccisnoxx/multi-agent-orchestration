@@ -1,5 +1,61 @@
 # Changelog
 
+## [1.6.0] - 2026-09-22
+
+### Added
+
+- `guard-dispatch --audit` 强制 plan 与 dispatch 在派发前已写入同一 open Audit Bundle stage，避免合规调用仍只留下临时证据。
+- 持久化 Audit Bundle version 1，默认存储于 `$CODEX_HOME/audits/multi-agent`。
+- `audit-init`：创建版本化、私有权限、带 retention 的任务审计目录。
+- `audit-stage`：为每个 WorkPlan 阶段分配稳定的 draft、plan、dispatch、execution 和 summary 路径。
+- `audit-finalize` / `audit-verify`：关闭 Bundle、生成可读产物、记录 artifact 清单和 SHA-256，并做离线完整性校验。
+- `audit-list` / `audit-show`：按 `audit_id` 发现和查看历史审计。
+- `audit-delete`：带显式确认和异常保护的安全删除。
+- `audit-prune`：按 retention dry-run 或批量清理。
+- `audit-import`：迁移既有 `/tmp` 审计目录。
+- Audit Bundle 生命周期、manifest 和保留策略的单元及 CLI 端到端测试。
+
+### Changed
+
+- 任意实际子代理派发现在都要求 WorkPlan 和持久化 Audit Bundle，包括单一无依赖 Worker。
+- 普通任务默认保留 14 天，高风险任务默认 90 天；异常 Bundle 至少保留 90 天。
+- 最终回复提供 `audit_id`，通过 `audit-list` / `audit-show` 定位，不默认暴露绝对路径。
+- macOS 安装脚本初始化私有 Audit Root。
+
+### Fixed
+
+- 子代理产物散落在 `/tmp` 或任意路径，后续无法发现、版本审计或安全删除的问题。
+
+## [1.5.3] - 2026-09-22
+
+### Added
+
+- `render-digest`：从已验证的 `SUBAGENT_EXECUTION_DIGEST.json` 纯渲染 Markdown，不重新读取当前 Agent TOML 或 `config.toml`。
+- 历史 Digest 配置漂移回归测试，覆盖计划生成后 `config.toml` 字节变化的场景。
+
+### Changed
+
+- 用户可见 Markdown 现在从已保存的 JSON Digest 快照生成；`digest` 继续负责重新校验 plan/execution 和当前配置。
+
+### Fixed
+
+- 当前 `config.toml` 与执行时配置哈希不一致时，仅为补生成 Markdown 而重新运行 `digest` 会触发 `codex_config_evidence` 漂移错误的问题。
+
+## [1.5.2] - 2026-09-22
+
+### Added
+
+- Digest Markdown 表格契约回归测试，固定表头、分隔行和每列顺序。
+
+### Changed
+
+- 使用 WorkPlan 的任务同时生成 JSON Digest 和 Markdown Digest。
+- 最终回复中的“子任务执行概览”必须直接复用本地 renderer 输出，不得根据 JSON 手工重建表格。
+
+### Fixed
+
+- 防止最终回复在手工拼接时合并 `agent_type`、模型、推理档位、执行尝试、验收通过和独立复核表头。
+
 ## [1.5.1] - 2026-09-22
 
 ### Added
