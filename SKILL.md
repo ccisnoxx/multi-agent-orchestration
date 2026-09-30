@@ -351,8 +351,11 @@ Execution record 必须记录实际派发方式、`fork_turns`、模型覆盖为
 ```
 
 提交最终回复前，读取实际生成的 Markdown 文件并确认表头、分隔行和数据行均为六列；若 Markdown Digest 尚未生成，先对已保存的 JSON Digest 运行 `render-digest`，不得重新聚合历史 plan/execution，也不得临时手工拼表。
-
 只有用户明确要求原始审计，或存在未验收通过、尚未验收、未执行 ready task、残留活跃 Worker、未知写入证据或配置冲突时，才展开对应细节。最终回复同时提供 Bundle 的 `audit_id`，使用户能够用 `audit-show`、`audit-verify` 或 `audit-delete` 定位和管理产物。
+当没有有效 `SUBAGENT_EXECUTION_DIGEST` 时，不得把子代理自然语言中的“未修改文件”“已完成”“测试通过”等自报状态当作审计事实。
+可以引用子代理自报状态，但必须明确归因并说明其证据等级，例如：
+“两个子代理均在各自回复中自报未修改文件；由于本轮未生成有效 digest，该声明未获得独立审计证据确认。”
+无 digest 时，写入证据状态应视为未知，而不是正常、无写入或已验证。
 
 ## 配置检查
 
@@ -366,3 +369,9 @@ Execution record 必须记录实际派发方式、`fork_turns`、模型覆盖为
 ```
 
 文件变化本身不证明当前会话已重新加载配置、角色、Skill 或工具 schema。
+
+## 最终执行摘要
+
+- 本轮实际创建一个或多个子代理后，在最终回复前读取并遵循 `references/final-reporting.md`。
+- 使用本机审计工具生成并校验属于当前任务的 `SUBAGENT_EXECUTION_DIGEST`。不得从线程状态、子代理自然语言回复或主代理自行维护的计数推导验收结果。
+- 没有实际创建子代理时，不生成该摘要。

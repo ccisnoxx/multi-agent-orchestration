@@ -23,7 +23,7 @@
       "sandbox_mode": "read-only",
       "profile_source": "agent_toml",
       "config_file": "reviewer.toml",
-      "config_sha256": "422aa163c7dfec439046340f7c91f4aa088d57c0007cc82d65859d0fd482e6ee"
+      "config_sha256": "80e5f94d469cc3f5a5ba01ec76ceba12c9a7d52b13ca57c1a9a9c0d907a6a25c"
     }
   },
   "codex_config_evidence": {
